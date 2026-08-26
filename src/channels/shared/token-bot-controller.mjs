@@ -203,6 +203,20 @@ export class TokenBotController {
     return this.status();
   }
 
+  async mutateBotConfig(botId, update) {
+    if (this.#closed) throw new Error(`${this.#descriptor.label} controller is closed`);
+    if (typeof update !== 'function') throw new TypeError('Bot config update must be a function');
+    await this.#withBotTransition(botId, async () => {
+      if (this.#closed) throw new Error(`${this.#descriptor.label} controller is closed`);
+      const config = this.#configStore.get(botId);
+      if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);
+      const savedConfig = await this.#configStore.save(update(config));
+      this.#runtimes.get(botId)?.applyConfig?.(savedConfig);
+      this.#touch();
+    });
+    return this.status();
+  }
+
   async sendConnectionTest(botId) {
     const config = this.#configStore.get(botId);
     if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);

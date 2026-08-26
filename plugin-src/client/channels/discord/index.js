@@ -4,6 +4,7 @@ import {
   DISCORD_ENDPOINTS,
   discordClientApi,
 } from './api.js';
+import { DiscordGroupResponseSettings } from './account-settings.js';
 import { installDiscordStyles } from './styles.js';
 
 const channel = createTokenChannelSettings({
@@ -19,7 +20,10 @@ const channel = createTokenChannelSettings({
   emptyTitle: '接入 Discord 机器人',
   emptyDescription: '先在 Developer Portal 创建 Bot 并邀请到服务器，再在这里完成接入。',
   platformLabel: 'Discord Developer Portal',
+  AccountSettings: DiscordGroupResponseSettings,
+  accountSettingsEndpoint: DISCORD_ENDPOINTS.setGroupResponseMode,
 });
 
 export const DiscordSettingsTab = channel.SettingsTab;
 export const DiscordAccountCard = channel.AccountCard;
+export { DiscordGroupResponseSettings };

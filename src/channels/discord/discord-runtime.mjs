@@ -4,6 +4,10 @@ import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
 import { DiscordApi } from './discord-api.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
+import {
+  DISCORD_GROUP_RESPONSE_MODES,
+  normalizeDiscordGroupResponseMode,
+} from './group-response-mode.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
@@ -245,6 +249,7 @@ export async function resolveDiscordMessageRoute(message, botId, {
   fetchImpl = fetch,
   signal,
   onChannel,
+  groupResponseMode,
 } = {}) {
   const normalized = normalizeDiscordMessage(message, botId, { fetchImpl });
   if (!normalized || normalized.senderIsBot) return normalized;
@@ -269,8 +274,16 @@ export async function resolveDiscordMessageRoute(message, botId, {
   if (sourceType !== GUILD_TEXT && sourceType !== GUILD_ANNOUNCEMENT) {
     return withConversationRoute(normalized, sourceChannel, botId, {
       fallback: 'unsupported-channel',
-      notice: '当前频道不支持自动创建 Thread，已直接在当前频道回复。',
+      notice: groupResponseMode === DISCORD_GROUP_RESPONSE_MODES.CHANNEL
+        ? null
+        : '当前频道不支持自动创建 Thread，已直接在当前频道回复。',
     });
+  }
+
+  // 'channel' mode 回复源频道,跳过自动建线程 —— 与 v0.16.0 行为一致。
+  if (normalizeDiscordGroupResponseMode(groupResponseMode)
+    === DISCORD_GROUP_RESPONSE_MODES.CHANNEL) {
+    return withConversationRoute(normalized, sourceChannel, botId);
   }
 
   signal?.throwIfAborted();
@@ -482,6 +495,15 @@ export class DiscordRuntime {
 
   get status() {
     return structuredClone(this.#status);
+  }
+
+  applyConfig(config) {
+    if (!config || typeof config !== 'object' || Array.isArray(config)) return;
+    this.#config = {
+      ...this.#config,
+      ...config,
+      groupResponseMode: normalizeDiscordGroupResponseMode(config.groupResponseMode),
+    };
   }
 
   async sendConnectionTest(text) {
@@ -712,6 +734,7 @@ export class DiscordRuntime {
         channel: this.#channels.get(String(message.channel_id)),
         signal: this.#abortController?.signal,
         onChannel: (resolved) => this.#rememberChannel(resolved),
+        groupResponseMode: this.#config.groupResponseMode,
       });
       this.#routing.set(messageId, route);
       void route.finally(() => {

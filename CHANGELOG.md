@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Added / 新增
+
+- Discord 机器人设置新增「群响应模式」开关,默认「线程模式」（被 @ 时自动建 Thread）;切换到「频道直接回复」后会保持 v0.16.0 及更早版本的行为:在被 @ 时直接在源频道 reply 主消息,不再创建 Thread。保存该开关时,RPC 错误会使用 DSH 客户端能识别的 `bad-request` / `internal` 形状,避免 Zod `invalid_union` 把配置面板打成无法保存。
+  Added a "group response mode" toggle in the Discord bot settings. The default "thread mode" keeps the existing auto-create-thread behavior when the bot is @-mentioned; switching to "channel mode" restores the v0.16.0 and earlier behavior of replying directly in the source channel without creating a thread. Saving the toggle now returns DSH-legal `bad-request` / `internal` RPC errors so the settings panel is not blocked by a Zod `invalid_union`.
+
 ## [2.6.0] - 2026-08-25
 
 ### Added / 新增

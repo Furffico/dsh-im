@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -9,6 +9,11 @@ import {
   deriveDiscordBotIdentity,
 } from '../../../src/channels/discord/config-store.mjs';
 import { DiscordController } from '../../../src/channels/discord/discord-controller.mjs';
+import {
+  DISCORD_GROUP_RESPONSE_MODES,
+  isDiscordGroupResponseMode,
+  normalizeDiscordGroupResponseMode,
+} from '../../../src/channels/discord/group-response-mode.mjs';
 import {
   DiscordApi,
   inspectDiscordToken,
@@ -444,6 +449,7 @@ test('Discord RPC rejects extra credential fields and removes token internals', 
     }),
     reconnectBot: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
     deleteBot: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
+    setGroupResponseMode: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
   };
   const handler = createDiscordRpcHandler(controller);
   const result = await handler(DISCORD_ENDPOINTS.bindCredentials, { token: TOKEN });
@@ -453,6 +459,12 @@ test('Discord RPC rejects extra credential fields and removes token internals', 
   const rejected = await handler(DISCORD_ENDPOINTS.bindCredentials, { token: TOKEN, appId: 'x' });
   assert.equal(rejected.ok, false);
   assert.equal(rejected.error.code, 'bad-request');
+  assert.deepEqual(rejected.error.details, { issues: [] });
+
+  const unknown = await handler('bot.group-response-mode.set.nope', { botId: 'discord_abc' });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.error.code, 'bad-request');
+  assert.deepEqual(unknown.error.details, { issues: [] });
 });
 
 test('Discord normalizes DMs and only addressed server messages', () => {
@@ -1608,4 +1620,295 @@ test('Discord runtime identifies on Gateway v10 and becomes ready', async () => 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(errors.length, 2);
   assert.equal(runtime.status.ready, false);
+});
+
+test('Discord groupResponseMode normalizer defaults to thread and rejects unknown values', () => {
+  assert.equal(normalizeDiscordGroupResponseMode(undefined), DISCORD_GROUP_RESPONSE_MODES.THREAD);
+  assert.equal(normalizeDiscordGroupResponseMode('channel'), DISCORD_GROUP_RESPONSE_MODES.CHANNEL);
+  assert.equal(normalizeDiscordGroupResponseMode('thread'), DISCORD_GROUP_RESPONSE_MODES.THREAD);
+  assert.equal(normalizeDiscordGroupResponseMode('something'), DISCORD_GROUP_RESPONSE_MODES.THREAD);
+  assert.equal(isDiscordGroupResponseMode(DISCORD_GROUP_RESPONSE_MODES.CHANNEL), true);
+  assert.equal(isDiscordGroupResponseMode('nope'), false);
+});
+
+test('Discord channel-mode routing replies in the source channel and never starts a thread', async () => {
+  const botId = '1234567890123456789';
+  const message = {
+    id: '111111111111111200',
+    channel_id: '222222222222222200',
+    guild_id: '444444444444444444',
+    author: { id: '333333333333333333', bot: false },
+    mentions: [{ id: botId }],
+    content: `<@${botId}> reply in channel`,
+  };
+  let starts = 0;
+  const route = await resolveDiscordMessageRoute(message, botId, {
+    channel: { id: message.channel_id, type: 0 },
+    api: {
+      async getChannel() { assert.fail('cached channel must be reused'); },
+      async startThreadFromMessage() {
+        starts += 1;
+        assert.fail('channel-mode must not start a thread');
+      },
+    },
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+  });
+  assert.equal(starts, 0);
+  assert.equal(route.conversationId, message.channel_id);
+  assert.equal(route.addressed, true);
+  assert.equal(route.requiresMention, true);
+  assert.deepEqual(route.replyTarget, {
+    channelId: message.channel_id,
+    replyToMessageId: message.id,
+  });
+  assert.deepEqual(route.conversationRoute, { peerId: message.channel_id });
+});
+
+test('Discord thread-mode routing (default) keeps the existing thread behavior', async () => {
+  const botId = '1234567890123456789';
+  const message = {
+    id: '111111111111111201',
+    channel_id: '222222222222222201',
+    guild_id: '444444444444444444',
+    author: { id: '333333333333333333', bot: false },
+    mentions: [{ id: botId }],
+    content: `<@${botId}> keep thread`,
+  };
+  const route = await resolveDiscordMessageRoute(message, botId, {
+    channel: { id: message.channel_id, type: 0 },
+    api: {
+      async getChannel() { assert.fail('cached channel must be reused'); },
+      async startThreadFromMessage() {
+        return {
+          id: message.id,
+          type: 11,
+          parent_id: message.channel_id,
+          owner_id: botId,
+        };
+      },
+    },
+  });
+  assert.equal(route.conversationId, message.id);
+  assert.deepEqual(route.conversationRoute, {
+    peerId: message.channel_id,
+    threadId: message.id,
+    managed: true,
+  });
+});
+
+test('Discord channel-mode routing still routes inside an existing managed thread', async () => {
+  const botId = '1234567890123456789';
+  const threadId = '111111111111111202';
+  const parentId = '222222222222222202';
+  const message = {
+    id: '111111111111111203',
+    channel_id: threadId,
+    guild_id: '444444444444444444',
+    author: { id: '333333333333333333', bot: false },
+    mentions: [{ id: botId }],
+    content: 'continue in thread',
+  };
+  const route = await resolveDiscordMessageRoute(message, botId, {
+    channel: {
+      id: threadId,
+      type: 11,
+      parent_id: parentId,
+      owner_id: botId,
+    },
+    api: {
+      async getChannel() { assert.fail('cached thread must be reused'); },
+      async startThreadFromMessage() { assert.fail('must not nest threads'); },
+    },
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+  });
+  assert.equal(route.conversationId, threadId);
+  assert.deepEqual(route.conversationRoute, {
+    peerId: parentId,
+    threadId,
+    managed: true,
+  });
+  assert.equal(route.requiresMention, false);
+});
+
+test('Discord channel-mode routing skips the unsupported-channel notice', async () => {
+  const botId = '1234567890123456789';
+  const message = {
+    id: '111111111111111204',
+    channel_id: '222222222222222204',
+    guild_id: '444444444444444444',
+    author: { id: '333333333333333333', bot: false },
+    mentions: [{ id: botId }],
+    content: `<@${botId}> unsupported`,
+  };
+  const route = await resolveDiscordMessageRoute(message, botId, {
+    channel: { id: message.channel_id, type: 15 },
+    api: {
+      async getChannel() { assert.fail('cached channel must be reused'); },
+      async startThreadFromMessage() { assert.fail('forum must not start thread'); },
+    },
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+  });
+  assert.deepEqual(route.conversationRoute, { peerId: message.channel_id, fallback: 'unsupported-channel' });
+  assert.equal(route.replyTarget.notice, undefined);
+});
+
+test('Discord config store normalizes groupResponseMode and defaults to thread', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-discord-mode-store-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, 'config.json');
+  const identity = deriveDiscordBotIdentity('1234567890123456789');
+  const saved = await new DiscordConfigStore(configPath).save({
+    ...identity,
+    platformId: '1234567890123456789',
+    name: 'Mode Bot',
+    username: 'mode_bot',
+    groupResponseMode: 'channel',
+  });
+  assert.equal(saved.groupResponseMode, 'channel');
+
+  const reloaded = await new DiscordConfigStore(configPath).load();
+  assert.equal(reloaded.get(identity.botId).groupResponseMode, 'channel');
+
+  await writeFile(configPath, `${JSON.stringify({
+    version: 1,
+    bots: [{
+      ...identity,
+      platformId: '1234567890123456789',
+      name: 'Legacy Bot',
+      username: 'legacy_bot',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }],
+  }, null, 2)}\n`);
+  const legacy = await new DiscordConfigStore(configPath).load();
+  assert.equal(legacy.get(identity.botId).groupResponseMode, undefined);
+});
+
+test('Discord controller exposes groupResponseMode and updates it without restarting the runtime', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-discord-mode-controller-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configStore = await new DiscordConfigStore(join(directory, 'config.json')).load();
+  const identity = deriveDiscordBotIdentity('1234567890123456789');
+  const credentialStore = credentials();
+  await credentialStore.set(identity.tokenRef, TOKEN);
+  await configStore.save({
+    ...identity,
+    platformId: '1234567890123456789',
+    name: 'Mode Bot',
+    username: 'mode_bot',
+  });
+
+  const runtimeRecords = [];
+  const controller = new DiscordController({
+    credentials: credentialStore,
+    configStore,
+    createRuntime: async ({ botId, config }) => {
+      const record = {
+        botId,
+        config: structuredClone(config),
+        starts: 0,
+        stops: 0,
+        modes: [],
+      };
+      runtimeRecords.push(record);
+      return {
+        status: { ready: true, connectionState: 'connected', harnessReachable: true },
+        async start() { record.starts += 1; },
+        async stop() { record.stops += 1; },
+        applyConfig(next) {
+          record.modes.push(next.groupResponseMode);
+          record.config = structuredClone(next);
+        },
+      };
+    },
+  });
+  await controller.initialize();
+  assert.deepEqual(
+    controller.status().bots[0].groupResponseMode,
+    DISCORD_GROUP_RESPONSE_MODES.THREAD,
+  );
+
+  await controller.setGroupResponseMode(identity.botId, 'channel');
+  assert.equal(runtimeRecords.length, 1);
+  assert.equal(runtimeRecords[0].starts, 1);
+  assert.deepEqual(runtimeRecords[0].modes, ['channel']);
+  assert.equal(runtimeRecords[0].config.groupResponseMode, 'channel');
+  assert.deepEqual(
+    controller.status().bots[0].groupResponseMode,
+    DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+  );
+
+  await assert.rejects(
+    () => controller.setGroupResponseMode(identity.botId, 'bogus'),
+    /groupResponseMode must be/,
+  );
+  await controller.close();
+});
+
+test('Discord RPC handler validates and persists setGroupResponseMode', async () => {
+  const calls = [];
+  const handler = createDiscordRpcHandler({
+    async status() { return { snapshot: { bots: [] } }; },
+    async bindCredentials() { return { snapshot: { bots: [] } }; },
+    async reconnectBot() { return { snapshot: { bots: [] } }; },
+    async deleteBot() { return { snapshot: { bots: [] } }; },
+    async setGroupResponseMode(botId, groupResponseMode) {
+      calls.push({ botId, groupResponseMode });
+      return { snapshot: { bots: [{ botId, groupResponseMode }] } };
+    },
+  });
+  const identity = deriveDiscordBotIdentity('1234567890123456789');
+  const accepted = await handler(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    botId: identity.botId,
+    groupResponseMode: 'channel',
+  });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual(calls, [{ botId: identity.botId, groupResponseMode: 'channel' }]);
+
+  const badMode = await handler(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    botId: identity.botId,
+    groupResponseMode: 'nope',
+  });
+  assert.equal(badMode.ok, false);
+  assert.equal(badMode.error.code, 'bad-request');
+  assert.deepEqual(badMode.error.details, { issues: [] });
+
+  const extraField = await handler(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    botId: identity.botId,
+    extra: 'field',
+  });
+  assert.equal(extraField.ok, false);
+  assert.equal(extraField.error.code, 'bad-request');
+  assert.deepEqual(extraField.error.details, { issues: [] });
+
+  const missingBotId = await handler(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    groupResponseMode: 'channel',
+  });
+  assert.equal(missingBotId.ok, false);
+  assert.equal(missingBotId.error.code, 'bad-request');
+  assert.deepEqual(missingBotId.error.details, { issues: [] });
+
+  const failed = createDiscordRpcHandler({
+    async status() { return { snapshot: { bots: [] } }; },
+    async bindCredentials() { return { snapshot: { bots: [] } }; },
+    async reconnectBot() { return { snapshot: { bots: [] } }; },
+    async deleteBot() { return { snapshot: { bots: [] } }; },
+    async setGroupResponseMode() { throw new Error('restart failed'); },
+  });
+  const rejected = await failed(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    botId: identity.botId,
+    groupResponseMode: 'channel',
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error.code, 'internal');
+  assert.deepEqual(rejected.error.details, {});
+
+  const abortController = new AbortController();
+  abortController.abort();
+  const cancelledResult = await handler(DISCORD_ENDPOINTS.setGroupResponseMode, {
+    botId: identity.botId,
+    groupResponseMode: 'channel',
+  }, abortController.signal);
+  assert.equal(cancelledResult.ok, false);
+  assert.equal(cancelledResult.error.code, 'cancelled');
+  assert.deepEqual(cancelledResult.error.details, {});
 });
