@@ -224,6 +224,30 @@ function publicArtifact(artifact) {
   });
 }
 
+function publicToolResult(artifacts) {
+  if (artifacts.length === 1) return publicArtifact(artifacts[0]);
+  return Object.freeze({
+    artifacts: Object.freeze(artifacts.map(publicArtifact)),
+  });
+}
+
+/** Normalize `path` to a list of non-empty strings. A string stays one file. */
+export function requestedPaths(args) {
+  const value = args?.path;
+  if (typeof value === 'string') {
+    return value.trim() ? [value] : [];
+  }
+  if (!Array.isArray(value)) return [];
+  const paths = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) {
+      throw new TypeError('Each file path must be a non-empty string.');
+    }
+    paths.push(item);
+  }
+  return paths;
+}
+
 function artifactKey(artifact) {
   return artifact.artifactId;
 }
@@ -362,8 +386,8 @@ export class OutboundArtifactRegistry {
   }
 
   async stage(args, exec) {
-    const requestedPath = args?.path;
-    if (typeof requestedPath !== 'string' || !requestedPath.trim()) {
+    const requestedPath = typeof args?.path === 'string' ? args.path : '';
+    if (!requestedPath.trim()) {
       throw new TypeError('A file path is required.');
     }
     const agent = exec?.agent;
@@ -576,52 +600,107 @@ export function createOutboundArtifactTool({ registry = outboundArtifactRegistry
   };
   const definition = Object.freeze({
     name: OUTBOUND_ARTIFACT_TOOL,
-    description: 'Send a readable file or generated image to the user through the current conversation. Existing and newly created files are both valid.',
+    description: 'Send a readable file or generated image to the user through the current conversation. Existing and newly created files are both valid. path may be one string or an array of strings.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         path: {
-          type: 'string',
-          description: 'Absolute path, or a path relative to the current workspace.',
+          description: 'Absolute path, a path relative to the current workspace, or an array of such paths.',
+          oneOf: [
+            { type: 'string' },
+            {
+              type: 'array',
+              items: { type: 'string' },
+            },
+          ],
         },
       },
       required: ['path'],
     },
     output: {
       schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          artifactId: { type: 'string' },
-          fileName: { type: 'string' },
-          size: { type: 'number' },
-        },
-        required: ['artifactId', 'fileName', 'size'],
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              artifactId: { type: 'string' },
+              fileName: { type: 'string' },
+              size: { type: 'number' },
+            },
+            required: ['artifactId', 'fileName', 'size'],
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              artifacts: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    artifactId: { type: 'string' },
+                    fileName: { type: 'string' },
+                    size: { type: 'number' },
+                  },
+                  required: ['artifactId', 'fileName', 'size'],
+                },
+              },
+            },
+            required: ['artifacts'],
+          },
+        ],
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `Registered ${value.fileName} (${value.size} bytes) for IM delivery.`,
-      }],
+      render: (_args, value) => {
+        if (Array.isArray(value?.artifacts)) {
+          const names = value.artifacts.map((artifact) => artifact.fileName).join(', ');
+          return [{
+            type: 'text',
+            text: `Registered ${value.artifacts.length} files for IM delivery: ${names}.`,
+          }];
+        }
+        return [{
+          type: 'text',
+          text: `Registered ${value.fileName} (${value.size} bytes) for IM delivery.`,
+        }];
+      },
     },
     async execute(args, exec) {
-      const artifact = await registry.stage(args, exec);
-      staged.set(exec, artifact);
-      return publicArtifact(artifact);
+      const paths = requestedPaths(args);
+      if (paths.length === 0) {
+        throw new TypeError('A file path is required.');
+      }
+      const artifacts = [];
+      try {
+        for (const path of paths) {
+          artifacts.push(await registry.stage({ path }, exec));
+        }
+      } catch (error) {
+        for (const artifact of artifacts) registry.release(artifact);
+        throw error;
+      }
+      staged.set(exec, artifacts);
+      return publicToolResult(artifacts);
     },
   });
 
   const onResult = (exec, result) => {
     if (exec?.name === OUTBOUND_ARTIFACT_TOOL) {
-      const artifact = staged.get(exec);
-      if (!artifact) return;
+      const artifacts = staged.get(exec);
+      if (!artifacts) return;
       staged.delete(exec);
+      const list = Array.isArray(artifacts) ? artifacts : [artifacts];
       if (result?.isError) {
-        registry.release(artifact);
+        for (const artifact of list) registry.release(artifact);
         return;
       }
-      if (exec.parent === undefined) registry.commit(artifact);
-      else appendPending(exec.parent, artifact);
+      if (exec.parent === undefined) {
+        for (const artifact of list) registry.commit(artifact);
+      } else {
+        for (const artifact of list) appendPending(exec.parent, artifact);
+      }
       return;
     }
     const pending = pendingByParent.get(exec?.token);
@@ -654,7 +733,7 @@ export function installOutboundArtifactTool(ctx, { registry = outboundArtifactRe
   ctx.systemPrompt.section({
     name: 'dsh-im:return-file',
     order: 115,
-    text: `When the user asks to receive a file or generated image, call ${OUTBOUND_ARTIFACT_TOOL} with its path. Existing files can be sent directly; do not recreate or rename a file solely for delivery.`,
+    text: `When the user asks to receive a file or generated image, call ${OUTBOUND_ARTIFACT_TOOL} with its path. path may be one string or an array of strings; prefer one array call when sending multiple files together. Existing files can be sent directly; do not recreate or rename a file solely for delivery.`,
   });
   return true;
 }

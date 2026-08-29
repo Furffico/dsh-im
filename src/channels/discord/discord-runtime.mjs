@@ -3,7 +3,7 @@ import { fetchFileStream } from '../shared/file-download.mjs';
 import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
-import { DiscordApi } from './discord-api.mjs';
+import { DiscordApi, DISCORD_MAX_MESSAGE_ATTACHMENTS } from './discord-api.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 import {
   DISCORD_GROUP_RESPONSE_MODES,
@@ -370,6 +370,36 @@ export class DiscordBotClient {
       replyToMessageId: target.replyToMessageId,
       signal: this.#signal,
     });
+  }
+
+  async sendFiles(target, files) {
+    const attachments = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (attachments.length <= 1) {
+      return this.sendFile(target, attachments[0]);
+    }
+    const providerMessageIds = [];
+    for (let index = 0; index < attachments.length; index += DISCORD_MAX_MESSAGE_ATTACHMENTS) {
+      const chunk = attachments.slice(index, index + DISCORD_MAX_MESSAGE_ATTACHMENTS);
+      try {
+        const result = await this.#api.createFileMessage({
+          channelId: target.channelId,
+          files: chunk,
+          replyToMessageId: index === 0 ? target.replyToMessageId : undefined,
+          signal: this.#signal,
+        });
+        if (typeof result?.id === 'string' && result.id) providerMessageIds.push(result.id);
+      } catch (error) {
+        if (providerMessageIds.length > 0 && error?.code !== 'artifact-delivery-uncertain') {
+          const uncertain = new Error('Discord attachment delivery result is uncertain', {
+            cause: error,
+          });
+          uncertain.code = 'artifact-delivery-uncertain';
+          throw uncertain;
+        }
+        throw error;
+      }
+    }
+    return { providerMessageIds };
   }
 
   addReaction(target, emoji, { signal } = {}) {

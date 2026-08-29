@@ -4,6 +4,13 @@
 
 This file records the notable changes in each dsh-im release. Its format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and its versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed / 变更
+
+- `dsh_im_return_file` 的 `path` 现在同时接受单个字符串和字符串数组。一次数组调用会登记多个文件；Discord 尽量把同一次调用的文件合并成一条附件消息（每条最多 10 个，超出后续发），其他渠道仍逐个发送。单个字符串的调用结果形状保持不变。
+  `dsh_im_return_file` now accepts `path` as either one string or an array of strings. One array call registers every file; Discord merges files from the same call into one attachment message when possible (10 per message, then another), while other channels still send them one by one. A single-string call keeps its previous result shape.
+
 ## [3.2.0] - 2026-08-29
 
 ### Added / 新增

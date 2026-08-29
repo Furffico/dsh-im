@@ -12,6 +12,7 @@ import {
   materializeOutboundArtifact,
   readExactArtifactFile,
   releaseOutboundArtifact,
+  requestedPaths,
 } from '../src/channels/shared/semantic/artifact.mjs';
 
 async function fixture(t) {
@@ -61,6 +62,17 @@ async function takeFile(registry, sessionId = 'session-artifact', turn = 7) {
   const file = await materializeOutboundArtifact(artifact);
   return { artifact, file };
 }
+
+test('requestedPaths keeps a string as one file and accepts a string array', () => {
+  assert.deepEqual(requestedPaths({ path: 'one.txt' }), ['one.txt']);
+  assert.deepEqual(requestedPaths({ path: ['a.txt', 'b.txt'] }), ['a.txt', 'b.txt']);
+  assert.deepEqual(requestedPaths({ path: '   ' }), []);
+  assert.deepEqual(requestedPaths({ path: [] }), []);
+  assert.throws(
+    () => requestedPaths({ path: ['ok.txt', ''] }),
+    (error) => error instanceof TypeError,
+  );
+});
 
 test('an existing file can be sent directly without recreation', async (t) => {
   const fx = await fixture(t);
@@ -118,6 +130,56 @@ test('empty, sensitive-looking, and extension-mismatched files are not filtered'
   assert.equal(files[1].bytes.toString().startsWith('PASSWORD='), true);
   assert.equal(files[2].bytes.toString(), 'not a PNG signature');
   for (const artifact of artifacts) releaseOutboundArtifact(artifact);
+});
+
+test('a path array registers every file and keeps a single path result shape', async (t) => {
+  const fx = await fixture(t);
+  await writeFile(join(fx.workspace, 'first.txt'), 'one');
+  await writeFile(join(fx.workspace, 'second.txt'), 'two');
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  const single = await execute(tool, { path: 'first.txt' }, execution(fx.agent, 'single'));
+  const many = await execute(
+    tool,
+    { path: ['first.txt', 'second.txt'] },
+    execution(fx.agent, 'many'),
+  );
+
+  assert.deepEqual(single, {
+    artifactId: 'artifact-id-1',
+    fileName: 'first.txt',
+    size: 3,
+  });
+  assert.equal(many.artifacts.length, 2);
+  assert.deepEqual(many.artifacts.map(({ fileName, size }) => ({ fileName, size })), [
+    { fileName: 'first.txt', size: 3 },
+    { fileName: 'second.txt', size: 3 },
+  ]);
+  assert.equal(new Set(many.artifacts.map((artifact) => artifact.artifactId)).size, 2);
+  const artifacts = fx.registry.take('session-artifact', 7);
+  assert.equal(artifacts.length, 3);
+  assert.deepEqual(artifacts.map((artifact) => artifact.origin.callId), [
+    'single',
+    'many',
+    'many',
+  ]);
+  for (const artifact of artifacts) releaseOutboundArtifact(artifact);
+});
+
+test('a path array rolls back earlier snapshots when a later path fails', async (t) => {
+  const fx = await fixture(t);
+  await writeFile(join(fx.workspace, 'ok.txt'), 'ok');
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  await assert.rejects(
+    tool.definition.execute(
+      { path: ['ok.txt', 'missing.txt'] },
+      execution(fx.agent, 'partial-array'),
+    ),
+    (error) => error.code === 'artifact-unavailable',
+  );
+
+  assert.deepEqual(fx.registry.take('session-artifact', 7), []);
 });
 
 test('the registry does not deduplicate or impose project-level file-count quotas', async (t) => {
@@ -381,7 +443,10 @@ test('Host installer always exposes the tool and explicitly permits existing fil
   assert.equal(installed, true);
   assert.equal(definition.name, OUTBOUND_ARTIFACT_TOOL);
   assert.match(definition.description, /Existing and newly created files are both valid/);
+  assert.match(definition.description, /one string or an array of strings/);
+  assert.equal(definition.parameters.properties.path.oneOf.length, 2);
   assert.match(section.text, /Existing files can be sent directly/);
+  assert.match(section.text, /array of strings/);
   assert.equal(typeof listeners.get('tools/result'), 'function');
   assert.equal(typeof listeners.get('session/event'), 'function');
   assert.equal(typeof listeners.get('session/disposed'), 'function');

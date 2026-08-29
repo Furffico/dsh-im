@@ -482,6 +482,9 @@ export class TextHarnessBridge {
       sendFile: typeof this.#bot.sendFile === 'function'
         ? (file) => this.#bot.sendFile(target, file)
         : undefined,
+      sendFiles: typeof this.#bot.sendFiles === 'function'
+        ? (files) => this.#bot.sendFiles(target, files)
+        : undefined,
       onFailure: (artifact, error) => setLastMessageFailure(this.#status, error, {
         userMessage: artifactFailureText(artifact?.fileName, error, this.#descriptor),
         reason: error?.code,

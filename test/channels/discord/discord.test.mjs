@@ -233,6 +233,45 @@ test('Discord API uploads a result file as a native attachment and preserves the
   assert.equal(Buffer.from(await attachment.arrayBuffer()).toString(), '<p>discord-result</p>');
 });
 
+test('Discord API uploads several result files as one native attachment message', async () => {
+  let request;
+  const api = new DiscordApi({
+    token: TOKEN,
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return jsonResponse({ id: '987654321012345690', attachments: [{ id: '1' }, { id: '2' }] });
+    },
+  });
+  const result = await api.createFileMessage({
+    channelId: '123456789012345678',
+    replyToMessageId: '123456789012345679',
+    files: [{
+      artifactId: 'artifact-discord-a',
+      deliveryKey: 'session:turn:artifact-discord-a',
+      fileName: 'a.txt',
+      mediaType: 'text/plain',
+      bytes: Buffer.from('one'),
+    }, {
+      artifactId: 'artifact-discord-b',
+      deliveryKey: 'session:turn:artifact-discord-b',
+      fileName: 'b.png',
+      mediaType: 'image/png',
+      bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+    }],
+  });
+
+  assert.equal(result.id, '987654321012345690');
+  const payload = JSON.parse(request.options.body.get('payload_json'));
+  assert.deepEqual(payload.attachments, [
+    { id: 0, filename: 'a.txt' },
+    { id: 1, filename: 'b.png' },
+  ]);
+  assert.match(payload.nonce, /^[0-9a-f]{25}$/);
+  assert.equal(request.options.body.get('files[0]').name, 'a.txt');
+  assert.equal(request.options.body.get('files[1]').name, 'b.png');
+  assert.equal(request.options.body.get('files[1]').type, 'image/png');
+});
+
 test('Discord sends PNG and JPEG artifacts as one native inline-preview attachment each', async () => {
   const requests = [];
   const api = new DiscordApi({
@@ -270,6 +309,37 @@ test('Discord sends PNG and JPEG artifacts as one native inline-preview attachme
     assert.equal(attachment.type, image.mediaType);
   }
   assert.equal(requests.length, 2);
+});
+
+test('Discord bot client merges files into one message and splits after ten attachments', async () => {
+  const operations = [];
+  const api = {
+    async createFileMessage(options) {
+      operations.push(options);
+      return { id: `msg-${operations.length}` };
+    },
+  };
+  const client = new DiscordBotClient({ api });
+  const target = {
+    channelId: '123456789012345678',
+    replyToMessageId: '123456789012345679',
+  };
+  const eleven = Array.from({ length: 11 }, (_, index) => ({
+    fileName: `file-${index}.txt`,
+    bytes: Buffer.from(String(index)),
+  }));
+
+  const merged = await client.sendFiles(target, eleven.slice(0, 2));
+  const split = await client.sendFiles(target, eleven);
+
+  assert.deepEqual(merged.providerMessageIds, ['msg-1']);
+  assert.equal(operations[0].files.length, 2);
+  assert.equal(operations[0].replyToMessageId, target.replyToMessageId);
+  assert.deepEqual(split.providerMessageIds, ['msg-2', 'msg-3']);
+  assert.equal(operations[1].files.length, 10);
+  assert.equal(operations[1].replyToMessageId, target.replyToMessageId);
+  assert.equal(operations[2].files.length, 1);
+  assert.equal(operations[2].replyToMessageId, undefined);
 });
 
 test('Discord attachment retry reuses one FormData body and one stable nonce', async () => {

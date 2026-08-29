@@ -15,7 +15,7 @@ import { createDeliveryReceipt } from '../src/channels/shared/semantic/delivery.
 
 let fixtureId = 0;
 
-async function committedArtifact(t, fileName, content) {
+async function committedArtifact(t, fileName, content, { callId } = {}) {
   fixtureId += 1;
   const suffix = String(fixtureId);
   const workspace = await mkdtemp(join(tmpdir(), `dsh-im-delivery-${suffix}-`));
@@ -34,11 +34,12 @@ async function committedArtifact(t, fileName, content) {
   };
   await writeFile(join(workspace, fileName), content);
   const tool = createOutboundArtifactTool({ registry });
+  const resolvedCallId = callId ?? `call-${suffix}`;
   const execution = {
     name: OUTBOUND_ARTIFACT_TOOL,
-    callId: `call-${suffix}`,
-    rootCallId: `call-${suffix}`,
-    token: Symbol(`call-${suffix}`),
+    callId: resolvedCallId,
+    rootCallId: resolvedCallId,
+    token: Symbol(resolvedCallId),
     agent,
   };
   await tool.definition.execute({ path: fileName }, execution);
@@ -305,6 +306,81 @@ test('abort during a failure notice remains terminal and releases the artifact',
   }), (error) => error?.name === 'AbortError');
 
   await assertReleased(artifact);
+});
+
+test('sendFiles delivers one same-call group together and leaves other calls sequential', async (t) => {
+  const first = await committedArtifact(t, 'grouped-a.txt', 'a', { callId: 'group-call' });
+  const second = await committedArtifact(t, 'grouped-b.txt', 'b', { callId: 'group-call' });
+  const third = await committedArtifact(t, 'alone.txt', 'c');
+  const grouped = [];
+  const singles = [];
+
+  const delivery = await deliverOutboundArtifacts({
+    artifacts: [first, second, third],
+    deliveryId: 'reply-grouped',
+    channelKey: 'test',
+    sendFiles: async (files) => {
+      grouped.push(files.map((file) => file.fileName));
+      return { id: 'group-1' };
+    },
+    sendFile: async (file) => {
+      singles.push(file.fileName);
+      return { id: 'file-1' };
+    },
+  });
+
+  assert.deepEqual(grouped, [['grouped-a.txt', 'grouped-b.txt']]);
+  assert.deepEqual(singles, ['alone.txt']);
+  assert.equal(delivery.artifactsSent, 3);
+  await assertReleased(first);
+  await assertReleased(second);
+  await assertReleased(third);
+});
+
+test('a failed grouped sendFiles falls back to one-by-one sendFile', async (t) => {
+  const first = await committedArtifact(t, 'fallback-a.txt', 'a', { callId: 'fallback-call' });
+  const second = await committedArtifact(t, 'fallback-b.txt', 'b', { callId: 'fallback-call' });
+  const singles = [];
+
+  const delivery = await deliverOutboundArtifacts({
+    artifacts: [first, second],
+    channelKey: 'test',
+    sendFiles: async () => {
+      throw rejected('artifact-too-large');
+    },
+    sendFile: async (file) => {
+      singles.push(file.fileName);
+      return { id: `file-${singles.length}` };
+    },
+  });
+
+  assert.deepEqual(singles, ['fallback-a.txt', 'fallback-b.txt']);
+  assert.equal(delivery.artifactsSent, 2);
+  await assertReleased(first);
+  await assertReleased(second);
+});
+
+test('an uncertain grouped sendFiles does not retry with sendFile', async (t) => {
+  const first = await committedArtifact(t, 'uncertain-a.txt', 'a', { callId: 'uncertain-call' });
+  const second = await committedArtifact(t, 'uncertain-b.txt', 'b', { callId: 'uncertain-call' });
+  let singles = 0;
+
+  const delivery = await deliverOutboundArtifacts({
+    artifacts: [first, second],
+    channelKey: 'test',
+    sendFiles: async () => {
+      throw rejected('artifact-delivery-uncertain');
+    },
+    sendFile: async () => {
+      singles += 1;
+    },
+  });
+
+  assert.equal(singles, 0);
+  assert.equal(delivery.artifactsSent, 0);
+  assert.equal(delivery.artifactSendErrors, 2);
+  await assertReleased(first);
+  await assertReleased(second);
 });
 
 test('mixed artifacts preserve order and merge existing receipt semantics', async (t) => {

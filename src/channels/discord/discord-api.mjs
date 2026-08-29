@@ -3,6 +3,7 @@ import { t } from '../shared/i18n.mjs';
 
 const DEFAULT_BASE_URL = 'https://discord.com/api/v10/';
 const DEFAULT_FILE_UPLOAD_TIMEOUT_MS = 120_000;
+export const DISCORD_MAX_MESSAGE_ATTACHMENTS = 10;
 const DISCORD_PERMISSION_ERRORS = new Set([50001, 50013]);
 const DISCORD_TOO_LARGE_ERRORS = new Set([40005]);
 
@@ -168,20 +169,34 @@ export class DiscordApi {
     });
   }
 
-  async createFileMessage({ channelId, file, replyToMessageId, signal }) {
-    if (!file || typeof file !== 'object'
-      || typeof file.fileName !== 'string' || !file.fileName
-      || !Buffer.isBuffer(file.bytes)) {
+  async createFileMessage({ channelId, file, files, replyToMessageId, signal }) {
+    const attachments = Array.isArray(files) && files.length > 0
+      ? files
+      : (file ? [file] : []);
+    if (attachments.length === 0 || attachments.length > DISCORD_MAX_MESSAGE_ATTACHMENTS) {
       throw new TypeError('A Discord attachment is required');
     }
-    const deliverySeed = cleanString(file.deliveryKey) ?? cleanString(file.artifactId);
+    for (const attachment of attachments) {
+      if (!attachment || typeof attachment !== 'object'
+        || typeof attachment.fileName !== 'string' || !attachment.fileName
+        || !Buffer.isBuffer(attachment.bytes)) {
+        throw new TypeError('A Discord attachment is required');
+      }
+    }
+    const deliverySeed = attachments
+      .map((attachment) => cleanString(attachment.deliveryKey) ?? cleanString(attachment.artifactId))
+      .filter(Boolean)
+      .join('\u0000');
     const nonce = deliverySeed
       ? createHash('sha256').update(deliverySeed).digest('hex').slice(0, 25)
       : undefined;
     const payload = new FormData();
     payload.append('payload_json', JSON.stringify({
       allowed_mentions: { parse: [], replied_user: false },
-      attachments: [{ id: 0, filename: file.fileName }],
+      attachments: attachments.map((attachment, index) => ({
+        id: index,
+        filename: attachment.fileName,
+      })),
       ...(nonce ? { nonce, enforce_nonce: true } : {}),
       ...(replyToMessageId ? {
         message_reference: {
@@ -191,11 +206,13 @@ export class DiscordApi {
         },
       } : {}),
     }));
-    payload.append(
-      'files[0]',
-      new Blob([file.bytes], { type: file.mediaType ?? 'application/octet-stream' }),
-      file.fileName,
-    );
+    for (const [index, attachment] of attachments.entries()) {
+      payload.append(
+        `files[${index}]`,
+        new Blob([attachment.bytes], { type: attachment.mediaType ?? 'application/octet-stream' }),
+        attachment.fileName,
+      );
+    }
     const targetChannelId = snowflake(channelId, 'channel id');
     if (signal?.aborted) throw abortReason(signal);
     const uploadSignal = requestSignal(signal, this.#fileUploadTimeoutMs);
