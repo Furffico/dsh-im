@@ -240,7 +240,8 @@ export function extractWeixinFiles(message, { fetchImpl = fetch } = {}) {
 
 function isWeixinHost(hostname) {
   const normalized = hostname.toLowerCase().replace(/\.$/, '');
-  return normalized === 'weixin.qq.com' || normalized.endsWith('.weixin.qq.com');
+  return normalized === 'weixin.qq.com' || normalized.endsWith('.weixin.qq.com')
+    || normalized === 'wechat.com' || normalized.endsWith('.wechat.com');
 }
 
 export function normalizeWeixinApiBaseUrl(value) {
@@ -708,8 +709,13 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
           base_info: baseInfo(),
         },
       });
-      if (response?.ret !== undefined && response.ret !== 0) {
-        throw new WeixinApiError('send-rejected', '微信服务拒绝了回复消息。');
+      const sendRejection = rejectedProviderResponse(response);
+      if (sendRejection) {
+        throw new WeixinApiError(
+          'send-rejected',
+          '微信服务拒绝了回复消息。',
+          { providerCode: sendRejection },
+        );
       }
       return true;
     },

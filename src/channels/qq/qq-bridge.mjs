@@ -1,5 +1,6 @@
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
+import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
 import {
   isControlCommand,
   runControlCommand,
@@ -20,6 +21,7 @@ import {
   runPresetCommand,
 } from '../shared/preset-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
 import {
   BatchInputManager,
   batchInputBusyMessage,
@@ -78,6 +80,7 @@ function helpText() {
     t('直接发送文字、图片或文件即可继续当前会话。'),
     t('/new  开启一个全新会话'),
     t('/compact  压缩当前会话的较早上下文'),
+    t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
     t('/workspace 工作区绝对路径  切换工作区'),
     t('/workspacelist  列出工作区绝对路径'),
     t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
@@ -363,6 +366,7 @@ export class QqHarnessBridge {
   #ownerUserOpenid;
   #harness;
   #state;
+  #contextEnhancement;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -372,7 +376,8 @@ export class QqHarnessBridge {
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
-  #acceptedMessageIds = new Set();
+  // Keep the accepted configuration through the existing queue/reply lifecycle.
+  #acceptedMessageIds = new Map();
   #approvalTasks = new Set();
   #commandTasks = new Set();
   #approvals;
@@ -383,6 +388,7 @@ export class QqHarnessBridge {
     ownerUserOpenid,
     harness,
     state,
+    contextEnhancement,
     status = createQqBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -401,6 +407,7 @@ export class QqHarnessBridge {
     this.#ownerUserOpenid = ownerUserOpenid;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -423,7 +430,10 @@ export class QqHarnessBridge {
       || this.#state.hasSeen(messageId)
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     const key = conversationKey(message);
-    this.#acceptedMessageIds.add(messageId);
+    this.#acceptedMessageIds.set(messageId, captureContextEnhancement(
+      this.#contextEnhancement,
+      message.kind === 'c2c' ? 'direct' : 'group',
+    ));
     if (message.kind === 'c2c'
       && (this.#ownerUserOpenid === '*' || sender === this.#ownerUserOpenid)
       && message.replyTarget?.scope === 'c2c'
@@ -468,7 +478,8 @@ export class QqHarnessBridge {
         return this.#finishBatchResult(message, messageId, result);
       }
     }
-    const commandRunner = hasQqFileAttachments(message) ? null : isControlCommand(commandText)
+    const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+      : hasQqFileAttachments(message) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
           ? runModelCommand
@@ -602,6 +613,7 @@ export class QqHarnessBridge {
     this.#status.lastMessageAt = new Date().toISOString();
     const result = await runner(text, this.#harness, this.#state, key, {
       signal: this.#signal,
+      isDirect: message.kind === 'c2c',
       hasImages: hasQqImageAttachments(message),
       hasFiles: hasQqFileAttachments(message),
       pendingInteraction: this.#pendingInteractions.has(key)
@@ -773,19 +785,19 @@ export class QqHarnessBridge {
         return;
       }
 
-      const content = hasImages
+      let content = hasImages
         ? await promptContentForMessage(promptMessage, { signal: this.#signal })
         : undefined;
-      // QQ C2C keeps one stream bubble. Progress is collected but never submitted:
-      // some clients reject replacing an already visible stream frame, which would
-      // otherwise leave a stale progress bubble plus a separate fallback answer.
-      if (message.kind === 'c2c' && target?.msgId && typeof this.#bot.openStream === 'function') {
-        try {
-          stream = this.#bot.openStream({ target });
-        } catch (error) {
-          this.#logger.warn?.('[dsh-im:qq] unable to start a QQ stream; using markdown fallback:', error);
-        }
+      const snapshot = this.#acceptedMessageIds.get(messageId);
+      if (snapshot) {
+        content = enhanceContextContent(content ?? text, snapshot, () => ({
+          channel: 'qq',
+          senderId: sender,
+          senderName: message.kind === 'group' ? message.senderName : undefined,
+        }));
       }
+      // QQ stream_messages can acknowledge a final frame without rendering it in
+      // some C2C clients. Standard Markdown delivery is the reliable reply path.
       const toolErrors = [];
       let answer;
       let artifacts = [];
@@ -797,7 +809,7 @@ export class QqHarnessBridge {
           harness: this.#harness,
           state: this.#state,
           key,
-          ...(hasImages ? { content } : { text }),
+          ...(content !== undefined ? { content } : { text }),
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },
           askOptions: {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 
+import { transform } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
@@ -121,28 +122,29 @@ test('IM settings renders nine IM channels plus the AI Office connector', async 
   assert.match(markup, /让 DeepSeek Harness 触手可及/);
   assert.match(markup, /class="dim-brand"/);
   assert.equal(IM_PLUGIN_VERSION, packageVersion);
-  assert.match(markup, /class="dim-brand" tabindex="0" aria-describedby="[^"]+"/);
-  assert.match(markup, /<strong class="dim-brandName">DSH-IM<\/strong>/);
   assert.match(markup, new RegExp(
-    `class="dim-versionTooltip" role="tooltip"><span>当前版本<\\/span><strong>v${packageVersion.replaceAll('.', '\\.')}`,
+    `<div class="dim-brandHeading"><strong class="dim-brandName">DSH-IM<\\/strong><span class="dim-brandVersion">v${packageVersion.replaceAll('.', '\\.')}<\\/span><\\/div>`,
   ));
+  assert.doesNotMatch(markup, /dim-versionTooltip|当前版本/);
   assert.doesNotMatch(markup, /dim-brandLogo|<img/);
   assert.match(markup, /href="https:\/\/github\.com\/xmanrui\/dsh-im"/);
   assert.match(markup, /target="_blank"/);
   assert.match(markup, /rel="noopener noreferrer"/);
   assert.match(markup, /aria-label="dsh-im GitHub"/);
+  assert.match(markup, /dim-updateTrigger[^>]*aria-haspopup="dialog"[^>]*>检查更新</);
+  assert.ok(markup.indexOf('dim-updateTrigger') < markup.indexOf('dim-githubAction'));
   assert.match(markup, /aria-describedby="[^"]+"/);
   assert.match(markup, /role="tooltip"[^>]*>帮助与反馈 · 前往 GitHub</);
   assert.match(styles, /\.dim-title \{[^}]*margin: 0 0 18px;/);
   assert.match(styles, /\.dim-title p \{[^}]*color: var\(--dsw-alias-label-secondary, #646a73\);[^}]*font-size: 12px;[^}]*font-weight: 500;/);
-  assert.match(styles, /\.dim-brand \{[^}]*position: relative;[^}]*display: flex;[^}]*flex-direction: column;[^}]*align-items: flex-start;[^}]*gap: 1px;[^}]*cursor: help;/);
-  assert.doesNotMatch(styles, /\.dim-brand:hover\s*\{[^}]*background:/);
+  assert.match(styles, /\.dim-brand \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*align-items: flex-start;[^}]*gap: 1px;/);
+  assert.match(styles, /\.dim-brandHeading \{[^}]*display: flex;[^}]*align-items: baseline;[^}]*gap: 8px;[^}]*white-space: nowrap;/);
   assert.match(styles, /\.dim-brandName \{[^}]*font-size: 20px;[^}]*font-weight: 800;[^}]*letter-spacing: \.04em;/);
-  assert.match(styles, /\.dim-versionTooltip \{[^}]*bottom: calc\(100% \+ 8px\);[^}]*display: inline-flex;[^}]*opacity: 0;[^}]*visibility: hidden;/);
-  assert.match(styles, /\.dim-brand:hover \.dim-versionTooltip, \.dim-brand:focus \.dim-versionTooltip \{[^}]*opacity: 1;[^}]*visibility: visible;/);
+  assert.match(styles, /\.dim-brandVersion \{[^}]*color: var\(--dsw-alias-label-tertiary, #8f959e\);[^}]*font: 500 10px\/16px[^}]*letter-spacing: 0;/);
+  assert.doesNotMatch(styles, /dim-versionTooltip|\.dim-brand:focus-visible/);
   assert.doesNotMatch(styles, /\.dim-brandLogo/);
   assert.match(styles, /\.dim-githubLink \{[^}]*border: 1px solid var\(--dsw-alias-border-l2, #dfe1e5\);[^}]*text-decoration: none;/);
-  assert.match(styles, /\.dim-githubTooltip \{[^}]*bottom: calc\(100% \+ 8px\);[^}]*transform: translateY\(3px\);/);
+  assert.match(styles, /\.dim-githubTooltip \{[^}]*top: calc\(100% \+ 8px\);[^}]*transform: translateY\(-3px\);/);
   assert.match(styles, /\.dim-githubAction:hover \.dim-githubTooltip, \.dim-githubAction:focus-within \.dim-githubTooltip \{[^}]*opacity: 1;[^}]*visibility: visible;/);
   assert.doesNotMatch(markup, /\d+ 个渠道|dim-channelCount/);
   assert.match(markup, />微信</);
@@ -602,13 +604,23 @@ test('all channel bot cards use the DingTalk card treatment', async () => {
   assert.doesNotMatch(styles, /\.dim-panel \.dim-botMetrics|\.dim-panel \.dim-botMetric/);
 });
 
-test('bot cards keep the full workspace path on its own single line', async () => {
+test('bot card status stays in the top-right corner at every responsive breakpoint', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+
+  assert.match(styles, /\.dim-panel \.dim-botCardTop \{[^}]*display: flex;[^}]*align-items: flex-start;[^}]*justify-content: space-between;/);
+  assert.match(styles, /\.dim-panel \.dim-botIdentity \{[^}]*min-width: 0;[^}]*flex: 1 1 0;/);
+  assert.match(styles, /\.dim-panel \.dim-botHealthGroup \{[^}]*flex: none;[^}]*justify-items: end;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-botCardTop \{ flex-direction: column;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-botHealthGroup \{ justify-items: start;/);
+});
+
+test('bot cards wrap full workspace paths without horizontal scrolling', async () => {
   const styles = await readFile(STYLES_URL, 'utf8');
 
   assert.match(styles, /\.dim-panel \.dim-workspace \{[^}]*grid-template-columns: minmax\(0, 1fr\) max-content;[^}]*row-gap: 4px;[^}]*margin-top: 6px;[^}]*padding: 6px 10px;/);
   assert.match(styles, /\.dim-panel \.dim-workspaceHeader \{[^}]*display: contents;/);
-  assert.match(styles, /\.dim-panel \.dim-workspacePath \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 2;[^}]*overflow-x: auto;[^}]*white-space: nowrap;/);
-  assert.doesNotMatch(styles, /\.dim-panel \.dim-workspacePath \{[^}]*text-overflow: ellipsis;/);
+  assert.match(styles, /\.dim-panel \.dim-workspacePath \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 2;[^}]*overflow: hidden;[^}]*overflow-wrap: anywhere;[^}]*white-space: normal;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-workspacePath \{[^}]*overflow-x: auto;/);
   assert.match(styles, /\.dim-panel \.dim-workspaceEdit \{[^}]*grid-column: 2;[^}]*grid-row: 1;[^}]*white-space: nowrap;/);
 });
 
@@ -641,6 +653,12 @@ test('the bundled DingTalk channel has no local sender approval workflow', async
   );
 });
 
+test('the bilingual dictionary has no duplicate object keys', async () => {
+  const source = await readFile(new URL('../plugin-src/client/i18n.js', import.meta.url), 'utf8');
+  const { warnings } = await transform(source, { loader: 'js', logLevel: 'silent' });
+  assert.deepEqual(warnings.filter((warning) => warning.id === 'duplicate-object-key'), []);
+});
+
 test('every shipped Chinese client string has an English projection', async () => {
   const paths = (await readdir(CLIENT_SOURCE_DIRECTORY_URL, { recursive: true }))
     .filter((path) => path.endsWith('.js') && path !== 'i18n.js');
@@ -664,12 +682,30 @@ test('every shipped Chinese client string has an English projection', async () =
   }
 });
 
-test('client registers a live bilingual locale seat and directory picker for the IM settings tab', async () => {
+test('client source contains no legacy Plugins-tab settings registrations', async () => {
+  const paths = (await readdir(CLIENT_SOURCE_DIRECTORY_URL, { recursive: true }))
+    .filter((path) => path.endsWith('.js'));
+  const sources = await Promise.all(paths.map(async (path) => ({
+    path,
+    source: await readFile(new URL(path, CLIENT_SOURCE_DIRECTORY_URL), 'utf8'),
+  })));
+  const legacy = sources
+    .filter(({ source }) => source.includes('settings.plugins.tab'))
+    .map(({ path }) => path);
+
+  assert.deepEqual(legacy, []);
+});
+
+test('client registers one top-level bilingual IM settings section with a directory picker', async () => {
   const effects = [];
   const registrations = [];
   const dictionaries = [];
   const directoryCalls = [];
-  const rpcCall = async () => ({ ok: true, value: {} });
+  const rpcCalls = [];
+  const rpcCall = async (...args) => {
+    rpcCalls.push(args);
+    return { ok: true, value: {} };
+  };
   const ctx = {
     effect(install, label) {
       effects.push({ install, label });
@@ -697,7 +733,7 @@ test('client registers a live bilingual locale seat and directory picker for the
     },
     slots: {
       inject(name, install) {
-        assert.equal(name, 'settings.plugins.tab');
+        assert.equal(name, 'settings.section');
         install();
       },
       register(options, component) {
@@ -717,11 +753,17 @@ test('client registers a live bilingual locale seat and directory picker for the
     assert.equal(dictionaries[0].namespace, IM_LOCALE_NAMESPACE);
     assert.deepEqual(Object.keys(dictionaries[0].value.en).sort(), Object.keys(dictionaries[0].value.zh).sort());
     assert.equal(registrations.length, 1);
+    assert.equal(registrations[0].options.name, 'settings.section');
+    assert.equal(registrations[0].options.id, 'xmanrui-dsh-im');
+    assert.equal(registrations[0].options.order, 21);
     assert.equal(registrations[0].options.locale, IM_LOCALE_NAMESPACE);
     assert.equal(registrations[0].options.label(), 'IM bots');
+    assert.equal(registrations[0].component, IMSettingsTab);
 
     const injected = registrations[0].options.inject();
     const signal = new AbortController().signal;
+    await injected.updateRpcCall('update.status', {}, signal);
+    assert.deepEqual(rpcCalls, [['/dsh-im', 'update.status', {}, signal]]);
     assert.deepEqual(
       await injected.workspaceDirectoryPicker.listDirectory('/workspace/current', signal),
       { path: '/workspace/current', entries: [] },
@@ -736,9 +778,9 @@ test('client registers a live bilingual locale seat and directory picker for the
       registrations[0].component,
       injected,
     ));
-    assert.match(markup, /DeepSeek Harness, always within reach/);
+    assert.match(markup, /Connecting DeepSeek Harness/);
     assert.match(markup, new RegExp(
-      `<span>Current version<\\/span><strong>v${IM_PLUGIN_VERSION.replaceAll('.', '\\.')}`,
+      `class="dim-brandVersion">v${IM_PLUGIN_VERSION.replaceAll('.', '\\.')}<\\/span>`,
     ));
     assert.match(markup, /Help &amp; feedback · Open GitHub/);
     assert.match(markup, />WeChat<|>Feishu<|>DingTalk<|>WeCom</);
@@ -821,6 +863,22 @@ test('all nine channel settings and connected cards render English copy', () => 
     assert.match(cardMarkup, /Check connection/);
     assert.match(cardMarkup, /Remove connection/);
     assert.doesNotMatch(cardMarkup, /[\p{Script=Han}]/u);
+
+    const qqRetryMarkup = renderToStaticMarkup(React.createElement(QqAccountCard, {
+      ...sharedCardProps,
+      removing: false,
+      account: {
+        ...account,
+        state: 'error',
+        connected: false,
+        error: {
+          code: 'connection-failed',
+          message: 'QQ 连接未就绪，插件会自动重试。',
+        },
+      },
+    }));
+    assert.match(qqRetryMarkup, /The QQ connection is not ready; the plugin will retry automatically\./);
+    assert.doesNotMatch(qqRetryMarkup, /[\p{Script=Han}]/u);
   } finally {
     setImTranslator(null);
   }

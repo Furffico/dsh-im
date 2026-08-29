@@ -30,6 +30,7 @@ import {
   isBatchInputCommand,
 } from '../shared/batch-input.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
+import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
 import {
   isControlCommand,
   runControlCommand,
@@ -45,9 +46,11 @@ import {
 } from '../shared/preset-command.mjs';
 import { runWorkspaceCommand, resolveSessionListWorkspace, workspacePathSnapshot } from '../shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
 import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
 import {
   createDeliveryReceipt,
+  providerMessageIdsFor,
 } from '../shared/semantic/delivery.mjs';
 import {
   channelDeliveryFailure,
@@ -159,7 +162,7 @@ function artifactFailureText(fileName, error) {
   const name = String(fileName ?? t('结果文件')).replace(/[\r\n]+/g, ' ').trim() || t('结果文件');
   switch (error?.code) {
     case 'artifact-permission-required':
-      return t('结果文件「{name}」已生成，但机器人缺少飞书文件上传权限 im:resource。请私聊机器人执行 /repair 命令，或者在插件页面点击“补全权限”按钮并扫码。完成飞书要求的发布审批后重试。', { name });
+      return t('结果文件「{name}」已生成，但机器人缺少飞书文件上传权限 im:resource。请私聊机器人执行 /repair 命令，或者在「IM机器人」设置页点击“补全权限”按钮并扫码。完成飞书要求的发布审批后重试。', { name });
     case 'artifact-too-large':
       return t('结果文件「{name}」超过飞书 30 MB 上限，未发送。', { name });
     case 'artifact-empty':
@@ -381,12 +384,14 @@ export class FeishuHarnessBridge {
   #channel;
   #harness;
   #state;
+  #contextEnhancement;
   #queues = new Map();
   #batchInputs = new BatchInputManager();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
   #resolvedQuestionReplies = new Map();
-  #acceptedMessageIds = new Set();
+  // Keep the accepted configuration through the existing queue/reply lifecycle.
+  #acceptedMessageIds = new Map();
   #interactionTasks = new Set();
   #commandTasks = new Set();
   /** All accepted card work, including tasks waiting behind an earlier click. */
@@ -445,6 +450,7 @@ export class FeishuHarnessBridge {
     channel,
     harness,
     state,
+    contextEnhancement,
     status,
     allowedSenderOpenIds = new Set(),
     botId,
@@ -481,6 +487,7 @@ export class FeishuHarnessBridge {
     this.#channel = channel;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
     this.#status = status;
     this.#allowedSenderOpenIds = allowedSenderOpenIds;
     this.#botId = nonEmptyString(botId);
@@ -549,7 +556,10 @@ export class FeishuHarnessBridge {
       if (chatId) rememberConnectionTestTarget(this.#state, { chatId });
     }
 
-    this.#acceptedMessageIds.add(messageId);
+    this.#acceptedMessageIds.set(messageId, captureContextEnhancement(
+      this.#contextEnhancement,
+      event.message.chat_type === 'p2p' ? 'direct' : event.message.chat_type === 'group' ? 'group' : null,
+    ));
     const processingReaction = this.#beginReaction(messageId);
     const commandMessage = extractInboundMessage(event, this.#client);
     const commandText = nonEmptyString(commandMessage.content) ?? '';
@@ -620,12 +630,15 @@ export class FeishuHarnessBridge {
         .finally(() => this.#acceptedMessageIds.delete(messageId));
       return processing;
     }
-    const commandRunner = hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
+    const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+      : hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
           ? runModelCommand
           : (isPresetCommand(commandText) ? runPresetCommand : null));
-    if (commandRunner && addressed) {
+    // In all-message group mode, history must still be refused locally rather
+    // than becoming a normal prompt when no mention is present.
+    if (commandRunner && (addressed || commandRunner === runHistoryCommand)) {
       const processing = this.#processFastCommand(
         event,
         messageId,
@@ -913,6 +926,7 @@ export class FeishuHarnessBridge {
       key,
       {
         signal: this.#signal,
+        isDirect: event.message.chat_type === 'p2p',
         hasImages: hasInboundImages(message),
         hasFiles: hasInboundFiles(message),
         pendingInteraction: this.#hasPendingInteraction(key),
@@ -2083,7 +2097,10 @@ export class FeishuHarnessBridge {
     try {
       const bound = await this.#harness.bindWorkspaceSession(key, sessionId);
       const title = String(bound?.title ?? '').replace(/\s+/gu, ' ').trim() || t('暂无标题');
-      await this.#send(chatId, t('已绑定会话「{title}」\nID：{id}', { title, id: bound?.sessionId ?? sessionId }));
+      await this.#send(chatId, [
+        t('已绑定会话「{title}」\nID：{id}', { title, id: bound?.sessionId ?? sessionId }),
+        t('发送 /history 查看最近对话。'),
+      ].join('\n'));
       await this.#sendMenuCard(key, chatId, { updateMessageId });
     } catch (error) {
       await this.#sendFailure(chatId, error, {
@@ -3134,9 +3151,16 @@ export class FeishuHarnessBridge {
       askCompleted = true;
       onAskComplete?.();
     };
-    const content = hasInboundImages(message)
+    let content = hasInboundImages(message)
       ? await promptContentForMessage(message, { signal: this.#signal })
       : undefined;
+    const snapshot = this.#acceptedMessageIds.get(messageId);
+    if (snapshot) {
+      content = enhanceContextContent(content ?? text, snapshot, () => ({
+        channel: 'feishu',
+        senderId: senderOpenId(event),
+      }));
+    }
     if (!this.#channel?.stream) {
       const { answer, artifacts = [] } = await askInWorkspaceSession({
         harness: this.#harness,
@@ -3307,7 +3331,7 @@ export class FeishuHarnessBridge {
       createDeliveryReceipt({
         deliveryId: messageId,
         presentation: 'feishu-cardkit',
-        providerMessageIds: stream?.messageId ? [stream.messageId] : [],
+        providerMessageIds: providerMessageIdsFor(stream),
       }),
     );
     this.#status.streamResponses = (this.#status.streamResponses ?? 0) + 1;

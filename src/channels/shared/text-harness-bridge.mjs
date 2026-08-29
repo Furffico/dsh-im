@@ -1,6 +1,8 @@
 import { t } from './i18n.mjs';
+import { captureContextEnhancement, enhanceContextContent } from './context-enhancement.mjs';
 import { runWorkspaceCommand } from './workspace-command.mjs';
 import { runCompactCommand } from './compact-command.mjs';
+import { isHistoryCommand, runHistoryCommand } from './history-command.mjs';
 import {
   isControlCommand,
   runControlCommand,
@@ -126,6 +128,7 @@ export class TextHarnessBridge {
   #bot;
   #harness;
   #state;
+  #contextEnhancement;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -133,7 +136,8 @@ export class TextHarnessBridge {
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
-  #acceptedMessageIds = new Set();
+  // Keep the accepted configuration through the existing queue/reply lifecycle.
+  #acceptedMessageIds = new Map();
   #approvalTasks = new Set();
   #commandTasks = new Set();
   #approvals;
@@ -144,6 +148,7 @@ export class TextHarnessBridge {
     bot,
     harness,
     state,
+    contextEnhancement,
     status = createTextBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -156,6 +161,7 @@ export class TextHarnessBridge {
     this.#bot = bot;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -170,7 +176,7 @@ export class TextHarnessBridge {
     return structuredClone(this.#status);
   }
 
-  accept(message) {
+  accept(message, { contextSnapshot } = {}) {
     if (this.#signal?.aborted) return Promise.resolve();
     const conversationId = cleanText(message?.conversationId);
     const kind = message?.kind === 'group' ? 'group' : 'direct';
@@ -181,7 +187,9 @@ export class TextHarnessBridge {
       || this.#state.hasSeen(messageId) || this.#acceptedMessageIds.has(messageId)) {
       return Promise.resolve();
     }
-    this.#acceptedMessageIds.add(messageId);
+    this.#acceptedMessageIds.set(messageId, contextSnapshot === undefined
+      ? captureContextEnhancement(this.#contextEnhancement, message?.kind)
+      : contextSnapshot);
     const statusReaction = beginStatusReaction({
       adapter: this.#bot,
       target: normalized.kind === 'direct' || normalized.addressed === true
@@ -260,7 +268,8 @@ export class TextHarnessBridge {
     }
     const collectingBatch = normalized.kind === 'direct'
       && this.#batches.status(key).phase === 'collecting';
-    const commandRunner = collectingBatch || hasInboundFiles(normalized) ? null : isControlCommand(text)
+    const commandRunner = collectingBatch ? null : isHistoryCommand(text) ? runHistoryCommand
+      : hasInboundFiles(normalized) ? null : isControlCommand(text)
       ? runControlCommand
       : (isModelCommand(text)
           ? runModelCommand
@@ -417,6 +426,7 @@ export class TextHarnessBridge {
         key,
         {
           signal: this.#signal,
+          isDirect: message.kind === 'direct',
           hasImages: hasInboundImages(message),
           hasFiles: hasInboundFiles(message),
           pendingInteraction: this.#pendingInteractions.has(key)
@@ -529,6 +539,7 @@ export class TextHarnessBridge {
           t('直接发送文字、图片或文件即可继续当前会话。'),
           t('/new  开启一个全新会话'),
           t('/compact  压缩当前会话的较早上下文'),
+          t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
           t('/workspace 工作区绝对路径  切换工作区'),
           t('/workspacelist  列出工作区绝对路径'),
           t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
@@ -610,9 +621,17 @@ export class TextHarnessBridge {
           );
         }
       }
-      const content = hasImages
+      let content = hasImages
         ? await promptContentForMessage(message, { signal: this.#signal })
         : undefined;
+      const snapshot = this.#acceptedMessageIds.get(messageId);
+      if (snapshot) {
+        content = enhanceContextContent(content ?? text, snapshot, () => ({
+          channel: this.#descriptor.key,
+          senderId,
+          senderName: message.contextSource?.()?.senderName,
+        }));
+      }
       const { answer, artifacts = [] } = await askInWorkspaceSession({
         harness: this.#harness,
         state: this.#state,

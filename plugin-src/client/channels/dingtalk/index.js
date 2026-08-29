@@ -3,6 +3,7 @@ import * as React from 'react';
 import { CredentialActionIcon, CredentialBindingPanel, QrActionIcon } from '../../credential-binding.js';
 import { h } from '../../i18n.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import { ContextEnhancementEditor } from '../../context-enhancement.js';
 import {
   AgentPresetCatalogContext,
   AgentPresetEditor,
@@ -16,7 +17,6 @@ import {
 } from '../../channel-card-meta.js';
 import {
   DINGTALK_ENDPOINTS,
-  DINGTALK_RPC_CHANNEL,
   connectionTestFeedback,
   formatRemaining,
   normalizeProvisioning,
@@ -28,9 +28,6 @@ import {
 import { installDingtalkStyles } from './styles.js';
 
 const ACTIVE_PROVISION_STATES = new Set(['pending', 'scanned', 'authorizing', 'creating', 'connecting']);
-
-export const name = 'dingtalk-settings';
-export const inject = ['slots', 'connection'];
 
 function DingtalkIcon({ size = 28 }) {
   return h('svg', {
@@ -224,6 +221,7 @@ export function AccountCard({
   onReconnect,
   onWorkspaceSave,
   onAgentPresetSave,
+  onContextEnhancementSave,
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
@@ -257,6 +255,11 @@ export function AccountCard({
         agentPreset: account.agentPreset,
         disabled: Boolean(busy),
         onSave: onAgentPresetSave,
+      }),
+      h(ContextEnhancementEditor, {
+        config: account.contextEnhancement,
+        disabled: Boolean(busy),
+        onSave: onContextEnhancementSave,
       }),
       h('div', { className: 'ddt-accountFooter dim-cardFooter' },
         h('div', { className: 'dim-cardFooterLayout' },
@@ -298,6 +301,7 @@ function AccountList(props) {
         onReconnect: () => props.onReconnect(account),
         onWorkspaceSave: (workspace) => props.onWorkspaceSave(account, workspace),
         onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(account, agentPreset),
+        onContextEnhancementSave: (config) => props.onContextEnhancementSave(account, config),
         onRequestRemove: () => props.onRequestRemove(account),
         onConfirmRemove: () => props.onConfirmRemove(account),
         onCancelRemove: props.onCancelRemove,
@@ -741,13 +745,13 @@ export function DingtalkSettingsTab({ rpcCall }) {
     }
   }, [discardStaleFeedback, invoke, loadStatus, setBotBusy, workspaceFence]);
 
-  const saveAgentPreset = React.useCallback(async (account, agentPreset) => {
+  const saveBotSetting = React.useCallback(async (account, operation, endpoint, payload) => {
     const snapshotVersion = workspaceFence.beginMutation();
-    setBotBusy(account.botId, 'preset');
+    setBotBusy(account.botId, operation);
     try {
       const snapshot = normalizeSnapshot(await invoke(
-        DINGTALK_ENDPOINTS.setAgentPreset,
-        { botId: account.botId, agentPreset },
+        endpoint,
+        { botId: account.botId, ...payload },
       ));
       if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
         setModel({
@@ -857,23 +861,15 @@ export function DingtalkSettingsTab({ rpcCall }) {
                   removeTarget,
                   onReconnect: (account) => void reconnect(account),
                   onWorkspaceSave: saveWorkspace,
-                  onAgentPresetSave: saveAgentPreset,
+                  onAgentPresetSave: (account, agentPreset) => saveBotSetting(
+                    account, 'preset', DINGTALK_ENDPOINTS.setAgentPreset, { agentPreset },
+                  ),
+                  onContextEnhancementSave: (account, config) => saveBotSetting(
+                    account, 'context-enhancement', DINGTALK_ENDPOINTS.setContextEnhancement, { config },
+                  ),
                   onRequestRemove: (account) => setRemoveTarget(account.botId),
                   onConfirmRemove: (account) => void remove(account),
                   onCancelRemove: () => setRemoveTarget(null),
                 })
               : null)));
-}
-
-export function apply(ctx) {
-  ctx.effect(() => installDingtalkStyles(), 'dingtalk-settings: install client styles');
-  const rpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(DINGTALK_RPC_CHANNEL, endpoint, payload, signal);
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab',
-    id: 'dingtalk',
-    order: 40,
-    label: '钉钉',
-    inject: () => ({ rpcCall }),
-  }, DingtalkSettingsTab));
 }

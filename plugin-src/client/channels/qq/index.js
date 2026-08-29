@@ -4,6 +4,7 @@ import { QqLogoGlyph } from '../../channel-logos.js';
 import { CredentialActionIcon, CredentialBindingPanel, QrActionIcon } from '../../credential-binding.js';
 import { h } from '../../i18n.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import { ContextEnhancementEditor } from '../../context-enhancement.js';
 import {
   AgentPresetCatalogContext,
   AgentPresetEditor,
@@ -18,7 +19,6 @@ import {
 import { installDingtalkStyles } from '../dingtalk/styles.js';
 import {
   QQ_ENDPOINTS,
-  QQ_RPC_CHANNEL,
   connectionTestFeedback,
   formatRemaining,
   normalizeProvisioning,
@@ -167,6 +167,7 @@ export function AccountCard({
   onReconnect,
   onWorkspaceSave,
   onAgentPresetSave,
+  onContextEnhancementSave,
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
@@ -198,6 +199,11 @@ export function AccountCard({
         agentPreset: account.agentPreset,
         disabled: Boolean(busy),
         onSave: onAgentPresetSave,
+      }),
+      h(ContextEnhancementEditor, {
+        config: account.contextEnhancement,
+        disabled: Boolean(busy),
+        onSave: onContextEnhancementSave,
       }),
       h('div', { className: 'ddt-accountFooter dim-cardFooter' },
         h('div', { className: 'dim-cardFooterLayout' },
@@ -469,6 +475,12 @@ export function QqSettingsTab({ rpcCall }) {
               QQ_ENDPOINTS.setAgentPreset,
               { botId: account.botId, agentPreset },
             ),
+            onContextEnhancementSave: (config) => botAction(
+              account,
+              'context-enhancement',
+              QQ_ENDPOINTS.setContextEnhancement,
+              { botId: account.botId, config },
+            ),
             onRequestRemove: () => setRemoveTarget(account.botId),
             onCancelRemove: () => setRemoveTarget(null),
             onConfirmRemove: async () => {
@@ -513,12 +525,4 @@ export function QqSettingsTab({ rpcCall }) {
             model.bots.length === 0 && !provision && !credentialOpen
               ? h(EmptyView, { busy, onStart: () => void startProvisioning() }) : null,
             botList)));
-}
-
-export function apply(ctx) {
-  ctx.effect(() => installQqStyles(), 'qq-settings: install client styles');
-  const rpcCall = (endpoint, payload, signal) => ctx.connection.rpc.call(QQ_RPC_CHANNEL, endpoint, payload, signal);
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab', id: 'qq', order: 50, label: 'QQ', inject: () => ({ rpcCall }),
-  }, QqSettingsTab));
 }

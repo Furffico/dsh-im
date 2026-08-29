@@ -6,7 +6,6 @@ import { h } from "../../i18n.js";
 import {
   FEISHU_ENDPOINTS,
   FEISHU_REGISTRATION_OPERATIONS,
-  FEISHU_RPC_CHANNEL,
   formatRemaining,
   normalizeBotsSnapshot,
   normalizeGroupResponseMode,
@@ -17,6 +16,7 @@ import {
 } from "./api.js";
 import { useAnimationFrameScheduler } from "../../lifecycle.js";
 import { WorkspaceEditor } from "../../workspace-editor.js";
+import { ContextEnhancementEditor } from "../../context-enhancement.js";
 import {
   AgentPresetCatalogContext,
   AgentPresetEditor,
@@ -28,11 +28,6 @@ import {
   ChannelListHeading,
   LastMessageErrorSummary,
 } from "../../channel-card-meta.js";
-import { installFeishuStyles } from "./styles.js";
-
-export const name = "feishu-settings";
-export const inject = ["slots", "connection"];
-
 const CALLBACK_REPAIR_OPERATION = FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR;
 const GROUP_MESSAGE_PERMISSION_OPERATION = FEISHU_REGISTRATION_OPERATIONS.GROUP_MESSAGE_PERMISSION;
 
@@ -559,6 +554,7 @@ export function BotCard({
   onRepairCallback,
   onWorkspaceSave,
   onAgentPresetSave,
+  onContextEnhancementSave,
   onGroupResponseModeSave,
   onGroupMessagePermissionAuthorize,
   onRequestRemove,
@@ -616,6 +612,11 @@ export function BotCard({
         agentPreset: connection.agentPreset,
         disabled: Boolean(busy),
         onSave: onAgentPresetSave,
+      }),
+      h(ContextEnhancementEditor, {
+        config: connection.contextEnhancement,
+        disabled: Boolean(busy),
+        onSave: onContextEnhancementSave,
       }),
       h(GroupResponseModeEditor, {
         value: connection.groupResponseMode,
@@ -714,6 +715,7 @@ function BotList(props) {
           onRepairCallback: () => props.onRepairCallback(bot),
           onWorkspaceSave: (workspace) => props.onWorkspaceSave(bot, workspace),
           onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(bot, agentPreset),
+          onContextEnhancementSave: (config) => props.onContextEnhancementSave(bot, config),
           onGroupResponseModeSave: (groupResponseMode) => props.onGroupResponseModeSave(bot, groupResponseMode),
           onGroupMessagePermissionAuthorize: () => props.onGroupMessagePermissionAuthorize(bot),
           onRequestRemove: () => props.onRequestRemove(bot),
@@ -1302,15 +1304,15 @@ export function FeishuSettingsTab({ rpcCall }) {
     }
   }, [invoke, loadStatus, mergeSnapshot, setBotBusy, setBotError, workspaceFence]);
 
-  const saveAgentPreset = React.useCallback(async (connection, agentPreset) => {
+  const saveBotSetting = React.useCallback(async (connection, operation, endpoint, payload) => {
     const { botId } = connection;
     const snapshotVersion = workspaceFence.beginMutation();
-    setBotBusy(botId, "preset");
+    setBotBusy(botId, operation);
     setBotError(botId, null);
     try {
       const snapshot = normalizeBotsSnapshot(await invoke(
-        FEISHU_ENDPOINTS.setAgentPreset,
-        { botId, agentPreset },
+        endpoint,
+        { botId, ...payload },
       ));
       if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
         mergeSnapshot(snapshot);
@@ -1527,7 +1529,12 @@ export function FeishuSettingsTab({ rpcCall }) {
                   onReconnect: (bot) => void reconnectOneBot(bot),
                   onRepairCallback: repairCallback,
                   onWorkspaceSave: saveWorkspace,
-                  onAgentPresetSave: saveAgentPreset,
+                  onAgentPresetSave: (connection, agentPreset) => saveBotSetting(
+                    connection, "preset", FEISHU_ENDPOINTS.setAgentPreset, { agentPreset },
+                  ),
+                  onContextEnhancementSave: (connection, config) => saveBotSetting(
+                    connection, "context-enhancement", FEISHU_ENDPOINTS.setContextEnhancement, { config },
+                  ),
                   onGroupResponseModeSave: saveGroupResponseMode,
                   onGroupMessagePermissionAuthorize: authorizeGroupMessages,
                   onRequestRemove: requestRemove,
@@ -1539,27 +1546,4 @@ export function FeishuSettingsTab({ rpcCall }) {
               : null,
           ),
   ));
-}
-
-export function apply(ctx) {
-  ctx.effect(
-    () => installFeishuStyles(),
-    "feishu-settings: install client styles",
-  );
-
-  const rpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(FEISHU_RPC_CHANNEL, endpoint, payload, signal);
-
-  ctx.slots.inject("settings.plugins.tab", () =>
-    ctx.slots.register(
-      {
-        name: "settings.plugins.tab",
-        id: "feishu",
-        order: 20,
-        label: "飞书",
-        inject: () => ({ rpcCall }),
-      },
-      FeishuSettingsTab,
-    ),
-  );
 }

@@ -4,12 +4,128 @@
 
 This file records the notable changes in each dsh-im release. Its format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and its versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.2.0] - 2026-08-29
 
 ### Added / 新增
 
-- Discord 机器人设置新增「群响应模式」开关,默认「线程模式」（被 @ 时自动建 Thread）;切换到「频道直接回复」后会保持 v0.16.0 及更早版本的行为:在被 @ 时直接在源频道 reply 主消息,不再创建 Thread。保存该开关时,RPC 错误会使用 DSH 客户端能识别的 `bad-request` / `internal` 形状,避免 Zod `invalid_union` 把配置面板打成无法保存。
-  Added a "group response mode" toggle in the Discord bot settings. The default "thread mode" keeps the existing auto-create-thread behavior when the bot is @-mentioned; switching to "channel mode" restores the v0.16.0 and earlier behavior of replying directly in the source channel without creating a thread. Saving the toggle now returns DSH-legal `bad-request` / `internal` RPC errors so the settings panel is not blocked by a Zod `invalid_union`.
+- 九个 IM 渠道的机器人设置新增可选“上下文增强”，可分别控制群聊与私聊，把勾选的渠道、会话类型、发送者和机器人来源字段连同自定义引导附加到普通用户消息；默认关闭、不额外查询平台资料，微信当前仅支持私聊。
+  Added optional context enhancement to bot settings across all nine IM channels. It can independently target group and direct chats and attach selected channel, conversation, sender, and bot source fields plus custom guidance to ordinary user messages. It is off by default, performs no extra profile queries, and currently supports direct chats only on Weixin.
+
+- 更新窗口新增手工更新命令及一键复制，页面更新失败时可在相同 Harness / Desktop 环境中通过 npm 更新；复制受限时可选中文本手动复制，安装完成后仍需手动重启。
+  Added a manual npm update command and copy button to the update dialog for use in the same Harness / Desktop environment when the in-page update fails. The command remains selectable if clipboard access fails, and installation still requires a manual restart.
+
+### Fixed / 修复
+
+- 钉钉群聊的流式回复现在会在进度、完成和清理阶段保留对发送者的原生提及，无需额外发送提醒消息；私聊与批量回复失败处理保持原有行为。
+  DingTalk streamed group replies now preserve the native mention of the sender across progress, completion, and cleanup without sending a separate reminder; direct chats and batch-reply failure handling retain their existing behavior.
+
+## [3.1.1] - 2026-08-28
+
+### Fixed / 修复
+
+- 飞书流式回复超过单卡长度限制时保留预览，生成结束后分段发送完整回答，不再因超限抛错而撤回卡片；分段保留 Unicode 字符、空白和所有消息 ID，解决 Issue #78。
+  Feishu streaming replies now keep a bounded preview and deliver the complete final answer across multiple cards instead of throwing and recalling the card when its length limit is exceeded. Splitting preserves Unicode characters, whitespace, and every message ID, resolving Issue #78.
+
+## [3.1.0] - 2026-08-28
+
+### Added / 新增
+
+- 「设置 → IM机器人」新增 npm 更新检查和确认安装按钮，复用当前 Desktop / Harness 的包管理机制；保护源码链接、校验精确版本与目标 profile，不拉取 GitHub，安装后提示手动重启。手动重启后可「刷新状态」核验生效，无需重载原页面。更新功能不会主动重启或刷新；宿主自带的界面刷新不代表后台版本已生效。
+  Added npm update checking and confirmed installation to Settings → IM Bot using the current Desktop / Harness package-management mechanism. It protects source links, verifies the exact version and target profile, uses no GitHub downloads, and requires a manual restart. Refresh status verifies the restarted Host without reloading the existing page. The updater does not request a restart or refresh; the host's own interface refresh does not mean the new backend version is running.
+
+- 九个聊天渠道统一新增私聊命令 `/history [数量]`，只读预览当前绑定会话的最近对话：默认 3 条、最多 5 条，超出上限自动按 5 条处理；过滤工具、推理和未完成回复，长正文截断，并复用各渠道现有文字回复机制。命令不创建会话或调用模型，绑定成功提示和中英文帮助同步提供入口。
+  Added `/history [count]` to direct chats on all nine channels to preview the bound Session's recent conversation without creating a Session or prompting the model. It defaults to 3 messages and caps larger counts at 5, omits tools, reasoning, and unfinished replies, truncates long text, and reuses each channel's existing text-reply mechanism. Binding confirmations and bilingual help now point to the command.
+
+### Fixed / 修复
+
+- 调整设置页渠道栏顶部间距，使渠道页签与扫码操作对齐。
+  Adjusted the channel rail's top spacing to align channel tabs with the scan action in settings.
+
+## [3.0.8] - 2026-08-28
+
+### Fixed / 修复
+
+- 本机 `dsh web` 与 DSH Desktop 的 IM 渠道和 AI Office 现在默认直接使用当前 Host 的内部 `apiProxy`，不再依赖回环 HTTP 端口或 Desktop 的浏览器/局域网访问开关；显式配置 `harnessBaseUrl` 时仍使用 HTTP/WebSocket，内部调用失败不会静默切换 Host。
+  IM channels and AI Office in local `dsh web` and DSH Desktop now use the current Host's internal `apiProxy` by default, removing the dependency on loopback HTTP ports or Desktop's browser/LAN access settings. Explicit `harnessBaseUrl` configurations still use HTTP/WebSocket, and failed internal calls never silently switch Hosts.
+
+## [3.0.7] - 2026-08-27
+
+### Fixed / 修复
+
+- `/compact` 同时兼容要求 `images` 字段的新 Harness 与不接受该字段的旧 Harness；仅在网关明确拒绝多余字段、命令尚未执行时回退，避免重复压缩。
+  `/compact` now supports both newer Harness endpoints that require `images` and older endpoints that reject it, falling back only after an explicit pre-execution field rejection to avoid duplicate compaction.
+
+### Documentation / 文档
+
+- 中英文 README 的联系方式新增 WhatsApp 二维码。
+  Added a WhatsApp contact QR code to the Chinese and English READMEs.
+
+## [3.0.6] - 2026-08-26
+
+### Fixed / 修复
+
+- 工作区目录选择器现在可以直接输入 Windows 盘符、UNC 共享或 POSIX 绝对路径并跳转；输入的目录无法读取时不会误选先前浏览的目录，解决 Issue #69。
+  The workspace directory picker now accepts direct Windows drive, UNC share, and POSIX absolute paths; an unreadable typed path can no longer accidentally select the previously browsed directory, resolving Issue #69.
+- 微信回复发送失败时会记录并展示脱敏的接口、域名、分段大小、上下文状态、HTTP 状态和平台错误码诊断，便于定位长回复部分投递等问题，同时不会泄露令牌或平台原始错误详情。
+  Failed WeChat reply delivery now records and presents sanitized endpoint, host, chunk-size, context, HTTP-status, and provider-code diagnostics for troubleshooting issues such as partially delivered long replies, without exposing tokens or raw provider error details.
+
+## [3.0.5] - 2026-08-26
+
+### Fixed / 修复
+
+- 微信扫码绑定和消息接口现在同时信任腾讯的 `wechat.com` 国际域名及其子域名，国际环境下的二维码验证、登录重定向和消息连接不再被错误拒绝，同时继续拦截伪装后缀域名。
+  WeChat QR provisioning and messaging APIs now also trust Tencent's international `wechat.com` domain and its subdomains, preventing valid QR verification, login redirects, and message connections from being rejected in international environments while still blocking lookalike suffix domains.
+
+## [3.0.4] - 2026-08-26
+
+### Changed / 变更
+
+- 回退 3.0.3 中未计划进入 `main` 的 WhatsApp 群聊提及、回复识别与群成员调用白名单改动；WhatsApp 行为恢复到 3.0.2。
+  Reverted the WhatsApp group mention/reply detection and group-caller allowlist changes from 3.0.3 that were not intended for `main`; WhatsApp behavior returns to 3.0.2.
+
+## [3.0.3] - 2026-08-26
+
+### Fixed / 修复
+
+- WhatsApp 开放响应模式现在会正确识别群聊中的提及和回复，并使用与私聊联系人分开保存的群成员号码列表控制调用者；群成员列表为空时允许所有群成员。
+  WhatsApp Open responses now correctly recognize group mentions and replies and use a separately stored group-member number list to control callers; an empty group list allows every group member.
+- 机器人卡片在窄屏布局下仍会把连接状态保持在卡片右上角，不再移动到机器人信息下方。
+  Bot cards now keep connection status in the top-right corner on narrow layouts instead of moving it below the bot identity.
+- 企业微信流式回复现在会把思考过程与最终答案分开呈现，工具进度只更新思考区域，避免覆盖或混入答案正文。
+  WeCom streaming replies now present thinking separately from the final answer, with tool progress updating only the thinking area instead of overwriting or mixing into the answer body.
+
+## [3.0.2] - 2026-08-26
+
+### Fixed / 修复
+
+- 设置页现在会在 `DSH-IM` 品牌标题旁常驻显示当前插件版本，不再需要悬停或键盘聚焦才能查看。
+  The settings page now displays the current plugin version persistently beside the `DSH-IM` brand heading instead of requiring hover or keyboard focus.
+
+## [3.0.1] - 2026-08-26
+
+### Fixed / 修复
+
+- QQ 私聊最终回答现在使用标准 Markdown 消息投递，避免部分客户端确认流式最终帧却不显示内容；长回答会安全拆分代码块和 GFM 表格，遵守被动回复配额，并仅在平台明确拒绝 Markdown 时逐段回退纯文本，避免不确定结果造成重复回复。
+  QQ direct-message final answers now use standard Markdown delivery to avoid clients that acknowledge but do not render final streaming frames. Long answers safely split fenced code and GFM tables, respect passive-reply quotas, and fall back to plain text per chunk only after a definite Markdown rejection, preventing duplicate replies after uncertain outcomes.
+- 优化英文设置界面的文案与间距，限制 Telegram 机器人卡片在窄面板内自适应显示，并把版本提示移到品牌标题下方，避免内容溢出或提示被裁切。
+  Polished English settings copy and spacing, constrained Telegram bot cards within narrow panels, and moved the version tooltip below the brand heading to prevent overflow or clipping.
+
+### Documentation / 文档
+
+- 英文 README 新增设置界面预览图。
+  Added a settings interface preview to the English README.
+
+## [3.0.0] - 2026-08-25
+
+### Changed / 变更
+
+- 「IM机器人」设置页已从插件页签迁移到一级设置菜单，并以 `order: 21` 尽量排在「Agent 预设」之后；新版不再注册旧二级入口。升级后重启 `dsh web` 并刷新浏览器即可使用，已有机器人配置和页面内的渠道专属 Logo 保持不变。
+  The **IM Bot** settings page has moved from a Plugins tab to the top-level settings menu and uses `order: 21` to follow **Agent Presets**. The new release no longer registers the legacy nested entry. Restart `dsh web` and refresh the browser after upgrading; existing bot configuration and channel-specific logos inside the page are preserved.
+
+### Fixed / 修复
+
+- 飞书中不含附件且仅有一个文本段落的富文本消息，如果内容是插件命令，现在会按普通文本命令处理，不再转发给 Harness。
+  In Feishu, attachment-free rich-text messages containing a single text paragraph are now handled as ordinary plugin commands instead of being forwarded to Harness.
 
 ## [2.6.0] - 2026-08-25
 
@@ -343,7 +459,19 @@ This file records the notable changes in each dsh-im release. Its format follows
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/xmanrui/dsh-im/compare/v3.1.1...v3.2.0
+[3.1.1]: https://github.com/xmanrui/dsh-im/compare/v3.1.0...v3.1.1
+[3.1.0]: https://github.com/xmanrui/dsh-im/compare/v3.0.8...v3.1.0
+[3.0.8]: https://github.com/xmanrui/dsh-im/compare/v3.0.7...v3.0.8
+[3.0.7]: https://github.com/xmanrui/dsh-im/compare/v3.0.6...v3.0.7
+[3.0.6]: https://github.com/xmanrui/dsh-im/compare/v3.0.5...v3.0.6
+[3.0.5]: https://github.com/xmanrui/dsh-im/compare/v3.0.4...v3.0.5
+[3.0.4]: https://github.com/xmanrui/dsh-im/compare/v3.0.3...v3.0.4
+[3.0.3]: https://github.com/xmanrui/dsh-im/compare/v3.0.2...v3.0.3
+[3.0.2]: https://github.com/xmanrui/dsh-im/compare/v3.0.1...v3.0.2
+[3.0.1]: https://github.com/xmanrui/dsh-im/compare/v3.0.0...v3.0.1
+[3.0.0]: https://github.com/xmanrui/dsh-im/compare/v2.6.0...v3.0.0
 [2.6.0]: https://github.com/xmanrui/dsh-im/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/xmanrui/dsh-im/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/xmanrui/dsh-im/compare/v2.3.0...v2.4.0

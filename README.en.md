@@ -40,7 +40,7 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 
 ## Interface
 
-![IM bot settings page](docs/images/imbot.png)
+![IM bot settings page](docs/images/imbot_en.png)
 
 ## Built-in channels
 
@@ -58,7 +58,7 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 
 Other IM platforms can be added through the same channel-adapter structure.
 
-All nine built-in channels can send JPEG, PNG, and WebP images, plus GIFs sent as image files, with optional captions to Harness. Each image is limited to 5 MB, and images in one message are limited to 20 MB in total. Downloading images or files from Feishu user messages requires the `im:message:readonly` tenant scope, shown on the confirmation page as **Read direct and group messages**; Feishu currently offers no narrower image-only scope for that download endpoint. Apps created through the built-in QR flow request it by default; for existing or manually connected apps, click **Complete permissions** in the plugin's Feishu settings and scan the QR code to incrementally add that scope, `im:resource` for uploading bot-sent images or files, and the card callback.
+All nine built-in channels can send JPEG, PNG, and WebP images, plus GIFs sent as image files, with optional captions to Harness. Each image is limited to 5 MB, and images in one message are limited to 20 MB in total. Downloading images or files from Feishu user messages requires the `im:message:readonly` tenant scope, shown on the confirmation page as **Read direct and group messages**; Feishu currently offers no narrower image-only scope for that download endpoint. Apps created through the built-in QR flow request it by default; for existing or manually connected apps, click **Complete permissions** on the IM Bot settings page and scan the QR code to incrementally add that scope, `im:resource` for uploading bot-sent images or files, and the card callback.
 
 ### Result-file and image delivery
 
@@ -96,7 +96,9 @@ Install the published stable release from npm (recommended):
 dsh plugin --profile web add -w @xmanrui/dsh-im
 ```
 
-Restart `dsh web`, then open **Settings → Plugins → IM Bot**.
+Restart `dsh web`, refresh the browser, then open **Settings → IM Bot**. The top-level IM Bot entry uses `order: 21` to follow **Agent Presets**, and the Plugins page no longer retains the old entry. Upgrading preserves existing bots, credentials, workspaces, Agent Presets, and Session bindings.
+
+Local `dsh web` and DSH Desktop use the current Host's internal `apiProxy` by default, without a loopback HTTP connection. Desktop's compatibility, extended-window, and advanced modes do not require browser access or LAN access to be enabled. An explicit channel `harnessBaseUrl` still uses the existing HTTP/WebSocket connection; failed internal calls never silently switch to another Host.
 
 To try the latest code before it is published to npm, use the GitHub-source installer instead:
 
@@ -126,10 +128,43 @@ Use the proxy URL required by your network and restart the Host after changing i
 | --- | --- |
 | Bot workspace | Each bot stores its workspace independently. New bots start with the Host's current working directory, which can later be changed from the bot card. |
 | Agent Preset | Each bot can choose an Agent Preset on its settings card. When none is chosen, new Sessions follow the Host's `agent-presets.default`. A channel-level `config.agentPreset` is only the default for later new bots on that channel. Changing the preset never modifies or clears existing Sessions; if the current chat already has a Session, send `/new` and then a regular message to create one with the new selection. |
+| Context enhancement | Open settings from a bot card to enable groups and DMs independently. Both switches default to off, including for existing bots after an upgrade. |
+
+### Context enhancement
+
+Open **Context enhancement** on a bot card to choose conversation scopes, source fields and guidance, then **Save**. The five available fields are `channel`, `conversationType`, `senderId`, `senderName` and `botId`; only `senderId` is selected by default. Only selected values already available in the incoming message are included; no platform profile API is queried. Weixin currently supports DMs only.
+
+When enabled, ordinary user messages receive a `<dsh_im_source>` prefix. Nonempty guidance is automatically wrapped in `<dsh_im_source_guidance>` tags. Guidance starts empty; the question-mark help includes instructions and an example, while **Use example** and **Clear** only edit the draft. No selected fields means no source block. Commands, approvals and question answers keep their existing control paths.
+
+When the current conversation scope is off, text, images, files and Session behavior are unchanged, without enhancement assembly or extra network queries. Unsaved or cancelled drafts have no effect. Saving does not reconnect bots or recreate Sessions; messages already received retain their original configuration snapshot.
+
+These blocks are **user-message content**, not changes to Harness, system prompts or permissions. Identifiers may contain platform user IDs or phone-number-like values and are sent to the current model and stored in Session history. Turning the feature off stops future additions; it does not erase existing history.
+
+### Access modes
 
 Each Telegram bot has its own access-mode control on its bot card. Existing and newly connected bots both default to **Compatible mode**: DMs receive replies, while group messages require a mention of or reply to the bot. Restrictions apply only after explicitly switching that bot to **Safe mode (private-chat allowlist)**. Safe mode ignores every group message and admits only numeric User IDs in that bot's allowlist. Enter one ID per line. Switching back to Compatible mode retains the allowlist without enforcing it, so it is available when Safe mode is enabled again. An empty allowlist in Safe mode rejects all inbound messages for that bot.
 
 Each WhatsApp bot also has its own access mode. Existing bots migrate to **Only me**, which is also the default for newly linked bots and accepts only self-chat messages from the linked account. **Selected contacts** additionally accepts direct messages from allowlisted phone numbers and ignores groups. Enter one number with its country or region code per line; a leading `+` is optional. **Open responses** accepts all direct messages, group messages sent by the linked account, and mentions of or replies to that account from other group members; this also lets an owner-only group act as a separate conversation. Switching modes retains the allowlist. An empty Selected contacts allowlist behaves like Only me, and rejected messages are ignored silently.
+
+## Checking and installing updates
+
+In **Settings → IM Bot**, click **Check for updates** immediately to the left of GitHub. The official npm registry is contacted only on request; confirm the target version and current profile before installing. Only `@xmanrui/dsh-im` is updated, without fetching GitHub or updating Harness / Desktop itself.
+
+After installation, the backend still requires a manual restart, and the panel reports **Installed; restart manually** based on the Host's status. The updater does not request a restart, hot reload, or page refresh. The host's existing module watcher may refresh the plugin interface, but an interface change does not mean the new backend version is running; the Host-reported running version is authoritative. Update when bots are idle, then restart the current Harness / Desktop yourself. Closing the settings page does not cancel a submitted installation.
+
+If the existing page still shows a restart notice after you restart manually, click **Refresh status** in the dialog or reopen **Restart needed**. This reads the current Host status without checking npm or refreshing the page.
+
+The button reuses Desktop's package-management service or the current Harness CLI for an exact-version install equivalent to the following (replace the example profile and version with the confirmed values):
+
+```sh
+dsh plugin --profile web add -w --save-exact @xmanrui/dsh-im@3.1.0 --registry=https://registry.npmjs.org/
+```
+
+The **Manual update** section at the bottom of the dialog generates a short command for the current profile, such as `dsh plugin --profile web add -w @xmanrui/dsh-im@3.1.1`. Click the copy icon at the far right of the command, then run it in a terminal. It requests a known target version; otherwise, `@latest` resolves the version from npm when executed. The manual command uses your local npm registry configuration without fetching GitHub; the install button still forces the official registry and saves an exact version. If clipboard access fails, select and copy the command manually. For Desktop, use the current Desktop's built-in terminal. For Web, use the environment that started the current Harness and preserve the same `DSH_HOME`. If a restart is already pending, restarting is usually enough without another installation. No potentially destructive command is generated for source links or profiles that cannot be safely identified.
+
+Source `link:`, `file:`, Git, and unrecognized installations can check versions but are never replaced automatically. Confirm the intended profile before manually migrating to npm. Conflicting scoped registries, incompatible Node versions, and unavailable Host executors disable installation with an explanation. Standard Windows CLI installations currently require a manual update; Desktop uses its existing executor.
+
+Do not modify the same profile through a terminal or plugin market during installation. A failed command may leave partial dependency changes; it is not an automatic rollback. Inspect the installation, reinstall the previous exact version if needed, and restart manually. The updater keeps only the profile's latest job and manifest backup under the current `DSH_HOME/updates/dsh-im`, without copying bot credentials. Resolve uncertain remaining installers or locks before retrying; do not blindly delete a lock.
 
 ## Bot commands
 
@@ -161,12 +196,13 @@ Each WhatsApp bot also has its own access mode. Existing bots migrate to **Only 
 | `/workspacelist` | List workspace absolute paths that still exist on the current Harness Host. |
 | `/sessionlist [workspace number or absolute path]` | List every registered session ID and title in the selected workspace; omit the argument to use the current workspace. |
 | `/session <Session ID>` | Bind the current chat to an existing Harness session. |
+| `/history [count]` | Preview recent messages from the bound Session in a direct chat; defaults to 3, capped at 5. |
 | Interactive question | Reply with an option number, option label, or custom text; separate multiple choices with commas. |
 | Remote approval | Reply with `批准` / `拒绝` / `同意` / `不同意` / `yes` / `no`. |
 
-Example: send `/models`, then `/model 2` to switch to the second model in the list; send `/reasoninglist`, then `/reasoning 2` to switch to the current model's second reasoning effort; send `/presetlist`, then `/preset 2` to select the second Agent Preset for this bot. Other examples: `/help`, `/new`, `/status`, `/version`, `/model deepseek-official/deepseek-v4-pro max`, `/reasoning --default`, `/preset marketing-jeep`, `/preset --default`, `/steer inspect only the configuration file`, `/stop`, `/compact`, `/workspace /Users/alice/projects/my-app`, `/sessionlist 2`, `/sessionlist /Users/alice/projects/my-app`, or `/session session-id`
+Example: send `/models`, then `/model 2` to switch to the second model in the list; send `/reasoninglist`, then `/reasoning 2` to switch to the current model's second reasoning effort; send `/presetlist`, then `/preset 2` to select the second Agent Preset for this bot. Other examples: `/help`, `/new`, `/status`, `/version`, `/model deepseek-official/deepseek-v4-pro max`, `/reasoning --default`, `/preset marketing-jeep`, `/preset --default`, `/steer inspect only the configuration file`, `/stop`, `/compact`, `/workspace /Users/alice/projects/my-app`, `/sessionlist 2`, `/sessionlist /Users/alice/projects/my-app`, `/session session-id`, `/history`, or `/history 5`
 
-If the Slack desktop app has no native Slash Command registered with the same name, it intercepts messages that begin directly with `/`. Send the command with one leading space instead, for example ` /presetlist` or ` /preset 2`; the plugin command layer trims surrounding whitespace, so it executes exactly like the unspaced form.
+If the Slack desktop app has no native Slash Command registered with the same name, it intercepts messages that begin directly with `/`. Send the command with one leading space instead, for example ` /presetlist`, ` /preset 2`, ` /history`, or ` /history 10`; the plugin command layer trims surrounding whitespace, so it executes exactly like the unspaced form.
 
 ### Command details
 
@@ -192,6 +228,8 @@ If the Slack desktop app has no native Slash Command registered with the same na
 - A numeric `/sessionlist` argument uses the same freshly resolved order as `/workspacelist` at command execution time. An absolute path can also select a workspace directly, and the result echoes the resolved path.
 - `/sessionlist` includes every session registered to the selected workspace. Archived sessions are marked as archived; blank and subagent sessions are included when they belong to that workspace; sessions without a title are shown as `No title yet`. Any listed ID can be passed directly to `/session Session ID`.
 - `/session` accepts exactly one Session ID obtained from `/sessionlist`. It neither creates a session nor immediately prompts the model; later messages in the current chat continue the bound session. Regular archived sessions can be bound without being unarchived, while subagent sessions cannot be bound.
+- `/history` works identically in direct chats on all nine channels. It only reads the Session already bound to this chat: it never creates a Session, prompts the model, or interrupts running tasks or pending interactions. It returns the latest 3 messages by default. `/history N` accepts a positive integer, caps values above 5 at 5, and returns fewer when fewer are available. Zero, negative, fractional, nonnumeric, and multiple arguments show usage; commands with images or files are rejected. While collecting batch input, use `/send` or `/cancel` first.
+- A user message or a final assistant reply counts as one history item, not one turn or day. The latest N items are displayed oldest first. Tool events, reasoning, injected content, and unfinished assistant output are omitted; old attachments are not downloaded or resent. Long text is marked as truncated, with at most 3 text segments per reply and no automatic pagination. After binding a Session, send `/history` manually; binding never replays history automatically. Message text may still contain sensitive information from the original conversation, so expose the bot only to trusted users.
 - `/session` locates the session's unique workspace automatically. Binding inside the current workspace replaces only this chat's mapping. A cross-workspace binding switches the bot workspace, clears the old session mappings for all of that bot's chats, and then binds this chat, so it affects the bot's other chats. A reply already being generated may still finish.
 - Workspace switches and session bindings only clear or replace dsh-im chat mappings. They never delete, empty, or archive old Session contents; an old Session can still be listed and bound again.
 - Any user admitted by the current channel access policy can run these commands; there is no separate administrator role. Telegram Compatible mode follows the original DM and group mention/reply rules, while Safe mode admits only allowlisted private users. WhatsApp Only me accepts self-chat only, Selected contacts accepts self-chat plus allowlisted direct messages, and Open responses accepts every direct message, group messages from the linked account, and mentions or replies from other group members.
@@ -214,7 +252,7 @@ If the Slack desktop app has no native Slash Command registered with the same na
 
 ## Design
 
-- Registers one **IM Bot** settings page containing nine IM channels and one AI Office Connector.
+- Registers one top-level **IM Bot** settings page containing nine IM channels and one AI Office Connector.
 - Maintains the Host, client, and runtime sources for all nine channels and the Office Connector in this repository without external standalone plugins.
 - Follows the DeepSeek Harness language preference and switches the settings UI live between Chinese and English. Bot chat messages follow the Host's `language` config (Chinese by default; `en` switches them to English), with Chinese always as the fallback so untranslated text is sent verbatim.
 - Uses logos for WeChat, Feishu, DingTalk, WeCom, QQ, Slack, Telegram, Discord, WhatsApp, and AI Office navigation without enable/disable switches.
@@ -257,13 +295,14 @@ Without a setting, Chinese is used. Chinese is always the fallback language — 
 
 ## Contact
 
-You can reach me by email, WeChat, or Xiaohongshu.
+You can reach me by email, WeChat, Xiaohongshu, or WhatsApp.
 
 <table>
   <tr>
     <th align="center">Email</th>
     <th align="center">WeChat</th>
     <th align="center">Xiaohongshu</th>
+    <th align="center">WhatsApp</th>
   </tr>
   <tr>
     <td align="center" valign="middle">
@@ -274,6 +313,9 @@ You can reach me by email, WeChat, or Xiaohongshu.
     </td>
     <td align="center" valign="top">
       <a href="docs/images/xhs.jpg"><img src="docs/images/xhs.jpg" alt="Xiaohongshu QR code" width="240"></a>
+    </td>
+    <td align="center" valign="top">
+      <a href="docs/images/WhatsApp.jpg"><img src="docs/images/WhatsApp.jpg" alt="WhatsApp QR code" width="240"></a>
     </td>
   </tr>
 </table>

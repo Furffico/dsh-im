@@ -1,6 +1,6 @@
 {
   "name": "@xmanrui/dsh-im",
-  "version": "2.6.0",
+  "version": "3.2.0",
   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
   "keywords": [
     "deepseek-harness",
@@ -30,6 +30,10 @@
     {
       "name": "C3H3-AI",
       "url": "https://github.com/C3H3-AI"
+    },
+    {
+      "name": "divingleee",
+      "url": "https://github.com/divingleee"
     }
   ],
   "license": "MIT",
@@ -83,7 +87,7 @@
   "scripts": {
     "build": "node plugin-src/client/build.mjs && node plugin-src/host/build.mjs",
     "test": "node --test test/*.test.mjs test/channels/*/*.test.mjs",
-    "check": "npm test && npm run build && node scripts/verify-package.mjs"
+    "check": "npm run build && npm test && node scripts/verify-package.mjs"
   },
   "engines": {
     "node": ">=22.19"
@@ -102,6 +106,7 @@
     "https-proxy-agent": "5.0.1",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "react-test-renderer": "18.3.1"
+    "react-test-renderer": "18.3.1",
+    "semver": "7.8.5"
   }
 }

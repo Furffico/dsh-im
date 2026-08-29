@@ -31,6 +31,7 @@ export class QqRuntime {
   #appSecret;
   #harness;
   #state;
+  #contextEnhancement;
   #logger;
   #replyTimeoutMs;
   #connectTimeoutMs;
@@ -48,6 +49,7 @@ export class QqRuntime {
     appSecret,
     harness,
     state,
+    contextEnhancement,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
@@ -61,6 +63,7 @@ export class QqRuntime {
     this.#appSecret = appSecret;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
@@ -124,6 +127,9 @@ export class QqRuntime {
       logger: sdkLogger,
       transport: 'websocket',
       tokenPrefetch: 'sync',
+      // sendText is reserved for literal notices/connection tests. Markdown
+      // replies use the explicit msg_type=2 path in sendMarkdownReply().
+      markdownSupport: false,
     });
     if (!bot || typeof bot.start !== 'function' || typeof bot.stop !== 'function') {
       throw new TypeError('QQ bot factory returned an invalid client');
@@ -136,6 +142,7 @@ export class QqRuntime {
       ownerUserOpenid: this.#config.ownerUserOpenid,
       harness: this.#harness,
       state: this.#state,
+      contextEnhancement: this.#contextEnhancement,
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
