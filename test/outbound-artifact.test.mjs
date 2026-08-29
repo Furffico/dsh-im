@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -88,6 +88,7 @@ test('an existing file can be sent directly without recreation', async (t) => {
   });
   const { artifact, file } = await takeFile(fx.registry);
   assert.equal(file.bytes.toString(), 'already here');
+  assert.equal(file.sourcePath, await realpath(join(fx.workspace, 'existing.txt')));
   releaseOutboundArtifact(artifact);
 });
 

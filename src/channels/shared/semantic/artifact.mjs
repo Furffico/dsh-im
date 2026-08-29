@@ -205,6 +205,7 @@ async function snapshotFile(workspace, requestedPath, signal) {
       fileName,
       mediaType: mediaTypeFor(fileName),
       size,
+      sourcePath: canonicalPath,
       digest: await hashFile(storagePath, signal),
       storagePath,
     });
@@ -782,6 +783,7 @@ export async function materializeOutboundArtifact(artifact, {
       fileName: artifact.fileName,
       mediaType: artifact.mediaType,
       size: artifact.size,
+      sourcePath: artifact.sourcePath,
       bytes,
     });
     materializedArtifactSources.set(file, artifact);

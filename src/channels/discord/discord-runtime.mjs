@@ -4,6 +4,10 @@ import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { DiscordApi, DISCORD_MAX_MESSAGE_ATTACHMENTS } from './discord-api.mjs';
+import {
+  discordAttachmentCaptions,
+  prepareDiscordAttachments,
+} from './image-compress.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 import {
   DISCORD_GROUP_RESPONSE_MODES,
@@ -334,11 +338,13 @@ export async function resolveDiscordMessageRoute(message, botId, {
 export class DiscordBotClient {
   #api;
   #signal;
+  #prepareAttachments;
   #deliveredNotices = new WeakSet();
 
-  constructor({ api, signal }) {
+  constructor({ api, signal, prepareAttachments = prepareDiscordAttachments }) {
     this.#api = api;
     this.#signal = signal;
+    this.#prepareAttachments = prepareAttachments;
   }
 
   async sendText(target, text) {
@@ -363,19 +369,29 @@ export class DiscordBotClient {
     return this.#api.sendTyping({ channelId: target.channelId, signal: this.#signal });
   }
 
-  sendFile(target, file) {
+  async sendFile(target, file) {
+    const [prepared] = await this.#prepareAttachments([file]);
     return this.#api.createFileMessage({
       channelId: target.channelId,
-      file,
+      file: prepared,
+      content: discordAttachmentCaptions(prepared ? [prepared] : []),
       replyToMessageId: target.replyToMessageId,
       signal: this.#signal,
     });
   }
 
   async sendFiles(target, files) {
-    const attachments = Array.isArray(files) ? files.filter(Boolean) : [];
+    const attachments = await this.#prepareAttachments(
+      Array.isArray(files) ? files.filter(Boolean) : [],
+    );
     if (attachments.length <= 1) {
-      return this.sendFile(target, attachments[0]);
+      return this.#api.createFileMessage({
+        channelId: target.channelId,
+        file: attachments[0],
+        content: discordAttachmentCaptions(attachments),
+        replyToMessageId: target.replyToMessageId,
+        signal: this.#signal,
+      });
     }
     const providerMessageIds = [];
     for (let index = 0; index < attachments.length; index += DISCORD_MAX_MESSAGE_ATTACHMENTS) {
@@ -384,6 +400,7 @@ export class DiscordBotClient {
         const result = await this.#api.createFileMessage({
           channelId: target.channelId,
           files: chunk,
+          content: discordAttachmentCaptions(chunk),
           replyToMessageId: index === 0 ? target.replyToMessageId : undefined,
           signal: this.#signal,
         });

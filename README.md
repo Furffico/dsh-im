@@ -78,7 +78,7 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 | QQ | 机器人需具备文件消息能力，并受 QQ 当日文件上传配额约束；额度耗尽时会明确提示稍后重试。 |
 | Slack | Bot Token 需有 `files:read`、`files:write` 和 `reactions:write`；实际文件大小上限由 Workspace 当前策略决定。已有 App 新增或变更 Scope 后，必须重新授权/安装 App 并重新连接机器人。 |
 | Telegram | 机器人必须能在当前聊天发送文档，实际可发送范围以 Bot API 返回为准。 |
-| Discord | Developer Portal 的 Bot 设置中需启用 **Message Content Intent**；机器人需有 **Send Messages**、**Create Public Threads**、**Send Messages in Threads** 和 **Read Message History** 权限；发送结果文件还需 **Attach Files**。实际附件额度由当前账号与服务器能力决定。 |
+| Discord | Developer Portal 的 Bot 设置中需启用 **Message Content Intent**；机器人需有 **Send Messages**、**Create Public Threads**、**Send Messages in Threads** 和 **Read Message History** 权限；发送结果文件还需 **Attach Files**。实际附件额度由当前账号与服务器能力决定。超过 10 MB 的 JPEG/PNG/WebP 会先各自转成 WebP（PNG 无损，JPEG quality 90），仍超限时再按面积比例估到约 8 MB 后缩放；同一次调用的多张图压完后仍尽量合并成一条附件消息。发送图片时会附上一行 `` `{绝对路径}` ({大小}) ``，压缩过的写成 `` `{绝对路径}` ({原大小} -> {压缩后大小}) ``，路径包在行内代码里以免 Windows 反斜杠被 Discord Markdown 转义。 |
 | WhatsApp | 当前绑定会话需支持 Document Message，实际可发送范围以 WhatsApp/Baileys 返回为准。 |
 
 ## AI Office Connector

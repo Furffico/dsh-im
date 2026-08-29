@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import sharp from 'sharp';
+
 import {
   DiscordConfigStore,
   deriveDiscordBotIdentity,
@@ -25,6 +27,18 @@ import {
   normalizeDiscordMessage,
   resolveDiscordMessageRoute,
 } from '../../../src/channels/discord/discord-runtime.mjs';
+import {
+  DISCORD_IMAGE_RESIZE_TARGET_BYTES,
+  DISCORD_IMAGE_SIZE_LIMIT_BYTES,
+  DISCORD_WEBP_QUALITY,
+  compressDiscordImageIfNeeded,
+  discordAttachmentCaptions,
+  discordImageCaption,
+  discordWebpEncodeOptions,
+  formatDiscordFileSize,
+  prepareDiscordAttachments,
+  resizeForTargetBytes,
+} from '../../../src/channels/discord/image-compress.mjs';
 import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
 import {
   DISCORD_ENDPOINTS,
@@ -196,6 +210,156 @@ test('Discord API adds and removes the current bot reaction with an encoded emoj
   assert.equal(requests[0].options.body, undefined);
 });
 
+test('Discord image captions include the absolute path and compressed size', () => {
+  assert.equal(formatDiscordFileSize(512), '0.5 KB');
+  assert.equal(formatDiscordFileSize(10 * 1024 * 1024), '10 MB');
+  assert.equal(discordImageCaption({
+    fileName: 'notes.txt',
+    mediaType: 'text/plain',
+    sourcePath: 'C:\\tmp\\notes.txt',
+    bytes: Buffer.from('text'),
+  }), null);
+  assert.equal(discordImageCaption({
+    fileName: 'photo.png',
+    mediaType: 'image/png',
+    sourcePath: 'D:\\out\\photo.png',
+    bytes: Buffer.alloc(2 * 1024 * 1024),
+  }), '`D:\\out\\photo.png` (2 MB)');
+  assert.equal(discordImageCaption({
+    fileName: 'photo.webp',
+    mediaType: 'image/webp',
+    sourcePath: 'D:\\out\\photo.png',
+    originalSize: 12 * 1024 * 1024,
+    bytes: Buffer.alloc(3 * 1024 * 1024),
+  }), '`D:\\out\\photo.png` (12 MB -> 3 MB)');
+  assert.equal(discordAttachmentCaptions([{
+    fileName: 'a.png',
+    mediaType: 'image/png',
+    sourcePath: '/tmp/a.png',
+    bytes: Buffer.alloc(1024),
+  }, {
+    fileName: 'skip.txt',
+    mediaType: 'text/plain',
+    sourcePath: '/tmp/skip.txt',
+    bytes: Buffer.from('x'),
+  }, {
+    fileName: 'b.jpg',
+    mediaType: 'image/jpeg',
+    sourcePath: '/tmp/b.jpg',
+    originalSize: 5 * 1024 * 1024,
+    bytes: Buffer.alloc(1024 * 1024),
+  }]), '`/tmp/a.png` (1 KB)\n`/tmp/b.jpg` (5 MB -> 1 MB)');
+});
+
+test('oversized Discord images convert to WebP then resize by area toward 8 MB', async () => {
+  assert.deepEqual(discordWebpEncodeOptions('image/png'), { lossless: true });
+  assert.deepEqual(discordWebpEncodeOptions('image/jpeg'), { quality: DISCORD_WEBP_QUALITY });
+  assert.equal(DISCORD_WEBP_QUALITY, 90);
+  const small = Buffer.from('small-png');
+  const unchanged = await compressDiscordImageIfNeeded({
+    fileName: 'ok.png',
+    mediaType: 'image/png',
+    bytes: small,
+  });
+  assert.equal(unchanged.bytes, small);
+
+  const gif = Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 8, 1);
+  const skippedGif = await compressDiscordImageIfNeeded({
+    fileName: 'loop.gif',
+    mediaType: 'image/gif',
+    bytes: gif,
+  });
+  assert.equal(skippedGif.bytes, gif);
+
+  const oversized = Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 24, 9);
+  const webp = Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 8, 2);
+  const resized = Buffer.from('resized-webp');
+  const calls = [];
+  const compressed = await compressDiscordImageIfNeeded({
+    fileName: 'photo.jpg',
+    mediaType: 'image/jpeg',
+    size: oversized.byteLength,
+    bytes: oversized,
+  }, {
+    encoder: async (input, size) => {
+      calls.push({ inputLength: input.byteLength, size });
+      return size ? resized : webp;
+    },
+    inspect: async () => ({ width: 4000, height: 2000 }),
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].size, undefined);
+  const expected = resizeForTargetBytes(
+    4000,
+    2000,
+    webp.byteLength,
+    DISCORD_IMAGE_RESIZE_TARGET_BYTES,
+  );
+  assert.deepEqual(calls[1].size, expected);
+  assert.equal(compressed.fileName, 'photo.webp');
+  assert.equal(compressed.mediaType, 'image/webp');
+  assert.equal(compressed.bytes.toString(), 'resized-webp');
+  assert.equal(compressed.size, resized.byteLength);
+
+  const grouped = await prepareDiscordAttachments([{
+    fileName: 'a.png',
+    mediaType: 'image/png',
+    bytes: oversized,
+  }, {
+    fileName: 'b.png',
+    mediaType: 'image/png',
+    bytes: oversized,
+  }, {
+    fileName: 'notes.txt',
+    mediaType: 'text/plain',
+    bytes: oversized,
+  }], {
+    encoder: async () => Buffer.from('grouped-webp'),
+  });
+  assert.equal(grouped[0].fileName, 'a.webp');
+  assert.equal(grouped[1].fileName, 'b.webp');
+  assert.equal(grouped[2].fileName, 'notes.txt');
+  assert.equal(grouped[0].bytes.toString(), 'grouped-webp');
+  assert.equal(grouped[2].bytes.byteLength, oversized.byteLength);
+
+  const swatch = {
+    create: {
+      width: 48,
+      height: 32,
+      channels: 3,
+      background: { r: 12, g: 80, b: 160 },
+    },
+  };
+  const png = await sharp(swatch).png().toBuffer();
+  const encodedPng = await compressDiscordImageIfNeeded({
+    fileName: 'swatch.png',
+    mediaType: 'image/png',
+    bytes: png,
+  }, { limitBytes: Math.max(1, png.byteLength - 1) });
+  assert.equal(encodedPng.fileName, 'swatch.webp');
+  const pngMeta = await sharp(encodedPng.bytes).metadata();
+  assert.equal(pngMeta.format, 'webp');
+  assert.equal(pngMeta.width, 48);
+  assert.equal(pngMeta.height, 32);
+  assert.equal(
+    Buffer.compare(
+      await sharp(png).removeAlpha().raw().toBuffer(),
+      await sharp(encodedPng.bytes).removeAlpha().raw().toBuffer(),
+    ),
+    0,
+  );
+
+  const jpeg = await sharp(swatch).jpeg({ quality: 95 }).toBuffer();
+  const encodedJpeg = await compressDiscordImageIfNeeded({
+    fileName: 'swatch.jpg',
+    mediaType: 'image/jpeg',
+    bytes: jpeg,
+  }, { limitBytes: Math.max(1, jpeg.byteLength - 1) });
+  const jpegMeta = await sharp(encodedJpeg.bytes).metadata();
+  assert.equal(jpegMeta.format, 'webp');
+});
+
 test('Discord API uploads a result file as a native attachment and preserves the reply', async () => {
   let request;
   const api = new DiscordApi({
@@ -222,6 +386,7 @@ test('Discord API uploads a result file as a native attachment and preserves the
   assert.equal(request.options.headers['content-type'], undefined);
   assert.ok(request.options.body instanceof FormData);
   const payload = JSON.parse(request.options.body.get('payload_json'));
+  assert.equal(payload.content, undefined);
   assert.deepEqual(payload.attachments, [{ id: 0, filename: 'result.html' }]);
   assert.match(payload.nonce, /^[0-9a-f]{25}$/);
   assert.equal(payload.enforce_nonce, true);
@@ -309,6 +474,98 @@ test('Discord sends PNG and JPEG artifacts as one native inline-preview attachme
     assert.equal(attachment.type, image.mediaType);
   }
   assert.equal(requests.length, 2);
+});
+
+test('Discord compresses a single oversized image to WebP before upload', async () => {
+  const operations = [];
+  const api = {
+    async createFileMessage(options) {
+      operations.push(options);
+      return { id: 'msg-compressed' };
+    },
+  };
+  const webp = Buffer.from('WEBP-OK');
+  const original = {
+    fileName: 'huge.png',
+    mediaType: 'image/png',
+    sourcePath: 'D:\\out\\huge.png',
+    size: DISCORD_IMAGE_SIZE_LIMIT_BYTES + 1,
+    bytes: Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 1, 7),
+  };
+  const client = new DiscordBotClient({
+    api,
+    prepareAttachments: async ([file]) => [{
+      ...file,
+      fileName: 'huge.webp',
+      mediaType: 'image/webp',
+      originalSize: file.bytes.byteLength,
+      size: webp.byteLength,
+      bytes: webp,
+    }],
+  });
+
+  await client.sendFile({
+    channelId: '123456789012345678',
+    replyToMessageId: '123456789012345679',
+  }, original);
+
+  assert.equal(operations.length, 1);
+  assert.equal(operations[0].file.fileName, 'huge.webp');
+  assert.equal(operations[0].file.mediaType, 'image/webp');
+  assert.equal(operations[0].file.bytes.toString(), 'WEBP-OK');
+  assert.equal(
+    operations[0].content,
+    `\`D:\\out\\huge.png\` (${formatDiscordFileSize(original.bytes.byteLength)} -> ${formatDiscordFileSize(webp.byteLength)})`,
+  );
+  assert.equal(original.fileName, 'huge.png');
+});
+
+test('Discord compresses grouped images then still sends them together', async () => {
+  const operations = [];
+  const api = {
+    async createFileMessage(options) {
+      operations.push(options);
+      return { id: 'msg-group' };
+    },
+  };
+  const webpA = Buffer.from('WEBP-A');
+  const webpB = Buffer.from('WEBP-B');
+  const files = [{
+    fileName: 'a.png',
+    mediaType: 'image/png',
+    sourcePath: '/tmp/a.png',
+    bytes: Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 12, 3),
+  }, {
+    fileName: 'b.png',
+    mediaType: 'image/png',
+    sourcePath: '/tmp/b.png',
+    bytes: Buffer.alloc(DISCORD_IMAGE_SIZE_LIMIT_BYTES + 16, 4),
+  }];
+  const client = new DiscordBotClient({
+    api,
+    prepareAttachments: async (attachments) => attachments.map((file, index) => ({
+      ...file,
+      fileName: file.fileName.replace(/\.png$/u, '.webp'),
+      mediaType: 'image/webp',
+      originalSize: file.bytes.byteLength,
+      size: index === 0 ? webpA.byteLength : webpB.byteLength,
+      bytes: index === 0 ? webpA : webpB,
+    })),
+  });
+
+  await client.sendFiles({
+    channelId: '123456789012345678',
+    replyToMessageId: '123456789012345679',
+  }, files);
+
+  assert.equal(operations.length, 1);
+  assert.equal(operations[0].files.length, 2);
+  assert.equal(operations[0].files[0].fileName, 'a.webp');
+  assert.equal(operations[0].files[1].fileName, 'b.webp');
+  assert.equal(
+    operations[0].content,
+    `\`/tmp/a.png\` (${formatDiscordFileSize(files[0].bytes.byteLength)} -> ${formatDiscordFileSize(webpA.byteLength)})\n\`/tmp/b.png\` (${formatDiscordFileSize(files[1].bytes.byteLength)} -> ${formatDiscordFileSize(webpB.byteLength)})`,
+  );
 });
 
 test('Discord bot client merges files into one message and splits after ten attachments', async () => {

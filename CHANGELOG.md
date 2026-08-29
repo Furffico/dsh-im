@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Added / 新增
+
+- Discord 超过 10 MB 的 JPEG/PNG/WebP 回传图片会先各自转成 WebP：PNG 用无损，JPEG 用 quality 90；若仍超限，再按面积比例估到约 8 MB 后缩放。同一次调用的多张图压完后仍尽量合并成一条附件消息。发送图片时会附上一行 `` `{绝对路径}` ({大小}) ``，压缩过的写成 `` `{绝对路径}` ({原大小} -> {压缩后大小}) ``，路径包在行内代码里以免 Windows 反斜杠被 Discord Markdown 转义。
+  Discord now compresses JPEG/PNG/WebP result images over 10 MB to WebP: lossless for PNG, quality 90 for JPEG, then a one-shot area-based resize aimed at about 8 MB if still too large. Multiple images from the same call are still merged into one attachment message after compression. Image messages include one `` `{absolute path}` ({size}) `` line per image, or `` `{absolute path}` ({original} -> {compressed}) `` when the file was compressed; the path is inline-coded so Discord Markdown does not eat Windows backslashes.
+
 ### Changed / 变更
 
 - `dsh_im_return_file` 的 `path` 现在同时接受单个字符串和字符串数组。一次数组调用会登记多个文件；Discord 尽量把同一次调用的文件合并成一条附件消息（每条最多 10 个，超出后续发），其他渠道仍逐个发送。单个字符串的调用结果形状保持不变。

@@ -169,7 +169,7 @@ export class DiscordApi {
     });
   }
 
-  async createFileMessage({ channelId, file, files, replyToMessageId, signal }) {
+  async createFileMessage({ channelId, file, files, content, replyToMessageId, signal }) {
     const attachments = Array.isArray(files) && files.length > 0
       ? files
       : (file ? [file] : []);
@@ -191,8 +191,10 @@ export class DiscordApi {
       ? createHash('sha256').update(deliverySeed).digest('hex').slice(0, 25)
       : undefined;
     const payload = new FormData();
+    const messageContent = cleanString(content);
     payload.append('payload_json', JSON.stringify({
       allowed_mentions: { parse: [], replied_user: false },
+      ...(messageContent ? { content: messageContent } : {}),
       attachments: attachments.map((attachment, index) => ({
         id: index,
         filename: attachment.fileName,
