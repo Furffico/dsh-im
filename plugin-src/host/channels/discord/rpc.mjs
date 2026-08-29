@@ -7,10 +7,15 @@ import {
   isDiscordGroupResponseMode,
   normalizeDiscordGroupResponseMode,
 } from '../../../../src/channels/discord/group-response-mode.mjs';
+import {
+  isDiscordSessionPermission,
+  normalizeDiscordSessionPermission,
+} from '../../../../src/channels/discord/session-permission.mjs';
 
 export const DISCORD_RPC_CHANNEL = '/discord';
 export const DISCORD_ENDPOINTS = Object.freeze({
   ...TOKEN_BOT_ENDPOINTS,
+  setAccountSettings: 'bot.account-settings.set',
   setGroupResponseMode: 'bot.group-response-mode.set',
 });
 export const DISCORD_RPC_ENDPOINTS = Object.freeze(Object.values(DISCORD_ENDPOINTS));
@@ -29,6 +34,10 @@ function validId(value) {
 
 function text(value, fallback) {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+}
+
+function validPermission(value) {
+  return value == null || isDiscordSessionPermission(value);
 }
 
 // DSH client-connection validates RpcResult.error with a discriminated union
@@ -65,26 +74,79 @@ function toPublicRpcResult(result) {
     return badRequest(text(error.message, 'Invalid Discord request.'));
   }
   if (error.code === 'cancelled') return cancelled();
+  if (error.code === 'workspace-bot-not-found'
+    || error.code === 'workspace-not-absolute'
+    || error.code === 'workspace-not-found'
+    || error.code === 'workspace-not-directory'
+    || error.code === 'agent-preset-invalid'
+    || error.code === 'agent-preset-unavailable'
+    || error.code === 'context-enhancement-invalid'
+    || error.code === 'invalid-token'
+    || error.code === 'discord-intents') {
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message: text(error.message, 'Discord 操作失败，请稍后重试。'),
+        details: isRecord(error.details) ? error.details : {},
+      },
+    };
+  }
   return internalFailure(text(error.message, 'Discord 操作失败，请稍后重试。'));
 }
 
-export function createDiscordRpcHandler(controller) {
-  if (typeof controller?.setGroupResponseMode !== 'function') {
-    throw new TypeError('A complete Discord controller is required (setGroupResponseMode)');
+function accountSettingsPayload(payload) {
+  if (!exactKeys(payload, ['botId', 'groupResponseMode', 'defaultSessionPermission'])
+    || !validId(payload.botId)
+    || !isDiscordGroupResponseMode(payload.groupResponseMode)
+    || !validPermission(payload.defaultSessionPermission)) {
+    return null;
   }
+  return {
+    botId: payload.botId,
+    groupResponseMode: normalizeDiscordGroupResponseMode(payload.groupResponseMode),
+    defaultSessionPermission: normalizeDiscordSessionPermission(payload.defaultSessionPermission),
+  };
+}
+
+export function createDiscordRpcHandler(controller) {
   const sharedHandler = createTokenBotRpcHandler(controller, { channel: 'Discord' });
   return async (endpoint, payload, signal) => {
-    if (endpoint !== DISCORD_ENDPOINTS.setGroupResponseMode) {
+    const isLegacyMode = endpoint === DISCORD_ENDPOINTS.setGroupResponseMode;
+    if (endpoint !== DISCORD_ENDPOINTS.setAccountSettings && !isLegacyMode) {
       return toPublicRpcResult(await sharedHandler(endpoint, payload, signal));
     }
     if (signal?.aborted) return cancelled();
-    if (!exactKeys(payload, ['botId', 'groupResponseMode']) || !validId(payload.botId)
-      || !isDiscordGroupResponseMode(payload.groupResponseMode)) {
-      return badRequest('请选择「线程模式」或「频道直接回复」。');
+    const settings = isLegacyMode
+      ? (
+        exactKeys(payload, ['botId', 'groupResponseMode'])
+          && validId(payload.botId)
+          && isDiscordGroupResponseMode(payload.groupResponseMode)
+          ? {
+            botId: payload.botId,
+            groupResponseMode: normalizeDiscordGroupResponseMode(payload.groupResponseMode),
+            defaultSessionPermission: undefined,
+          }
+          : null
+      )
+      : accountSettingsPayload(payload);
+    if (!settings) {
+      return badRequest(isLegacyMode
+        ? '请选择「线程模式」或「频道直接回复」。'
+        : '请选择群响应模式，以及「跟随 Host 默认」、「Workspace Write」或「Full access」。');
     }
-    const normalized = normalizeDiscordGroupResponseMode(payload.groupResponseMode);
     try {
-      const value = await controller.setGroupResponseMode(payload.botId, normalized);
+      let value;
+      if (isLegacyMode && typeof controller.setGroupResponseMode === 'function') {
+        value = await controller.setGroupResponseMode(settings.botId, settings.groupResponseMode);
+      } else if (typeof controller.setAccountSettings === 'function') {
+        value = await controller.setAccountSettings(settings.botId, {
+          groupResponseMode: settings.groupResponseMode,
+          defaultSessionPermission: settings.defaultSessionPermission,
+        });
+      } else {
+        return badRequest('请选择「线程模式」或「频道直接回复」。');
+      }
       return signal?.aborted ? cancelled() : { ok: true, value };
     } catch {
       return signal?.aborted ? cancelled() : internalFailure();

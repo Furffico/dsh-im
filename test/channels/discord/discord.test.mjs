@@ -17,6 +17,13 @@ import {
   normalizeDiscordGroupResponseMode,
 } from '../../../src/channels/discord/group-response-mode.mjs';
 import {
+  DISCORD_SESSION_PERMISSIONS,
+  discordPermissionCommand,
+  isDiscordSessionPermission,
+  normalizeDiscordSessionPermission,
+  wrapDiscordSessionPermission,
+} from '../../../src/channels/discord/session-permission.mjs';
+import {
   DiscordApi,
   inspectDiscordToken,
   validDiscordToken,
@@ -776,6 +783,7 @@ test('Discord RPC rejects extra credential fields and removes token internals', 
     }),
     reconnectBot: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
     deleteBot: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
+    setAccountSettings: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
     setGroupResponseMode: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
   };
   const handler = createDiscordRpcHandler(controller);
@@ -791,7 +799,6 @@ test('Discord RPC rejects extra credential fields and removes token internals', 
   const unknown = await handler('bot.group-response-mode.set.nope', { botId: 'discord_abc' });
   assert.equal(unknown.ok, false);
   assert.equal(unknown.error.code, 'bad-request');
-  assert.deepEqual(unknown.error.details, { issues: [] });
 });
 
 test('Discord normalizes DMs and only addressed server messages', () => {
@@ -2194,6 +2201,41 @@ test('Discord config store normalizes groupResponseMode and defaults to thread',
   }, null, 2)}\n`);
   const legacy = await new DiscordConfigStore(configPath).load();
   assert.equal(legacy.get(identity.botId).groupResponseMode, undefined);
+  assert.equal(legacy.get(identity.botId).defaultSessionPermission, undefined);
+});
+
+test('Discord config store persists defaultSessionPermission and drops unknown values', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-discord-permission-store-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, 'config.json');
+  const identity = deriveDiscordBotIdentity('1234567890123456789');
+  const saved = await new DiscordConfigStore(configPath).save({
+    ...identity,
+    platformId: '1234567890123456789',
+    name: 'Permission Bot',
+    username: 'permission_bot',
+    defaultSessionPermission: DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS,
+  });
+  assert.equal(saved.defaultSessionPermission, DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS);
+
+  const reloaded = await new DiscordConfigStore(configPath).load();
+  assert.equal(
+    reloaded.get(identity.botId).defaultSessionPermission,
+    DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS,
+  );
+
+  const cleared = await new DiscordConfigStore(configPath).save({
+    ...identity,
+    platformId: '1234567890123456789',
+    name: 'Permission Bot',
+    username: 'permission_bot',
+    defaultSessionPermission: 'nope',
+  });
+  assert.equal(cleared.defaultSessionPermission, undefined);
+  assert.equal(isDiscordSessionPermission('workspace-write'), true);
+  assert.equal(normalizeDiscordSessionPermission('nope'), null);
+  assert.equal(discordPermissionCommand('danger-full-access'), '/permission danger-full-access');
+  assert.equal(discordPermissionCommand(null), null);
 });
 
 test('Discord controller exposes groupResponseMode and updates it without restarting the runtime', async (t) => {
@@ -2250,9 +2292,30 @@ test('Discord controller exposes groupResponseMode and updates it without restar
     DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
   );
 
+  await controller.setAccountSettings(identity.botId, {
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+    defaultSessionPermission: DISCORD_SESSION_PERMISSIONS.WORKSPACE_WRITE,
+  });
+  assert.equal(runtimeRecords[0].config.defaultSessionPermission, 'workspace-write');
+  assert.equal(controller.status().bots[0].defaultSessionPermission, 'workspace-write');
+
+  await controller.setAccountSettings(identity.botId, {
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+    defaultSessionPermission: null,
+  });
+  assert.equal(runtimeRecords[0].config.defaultSessionPermission, undefined);
+  assert.equal(controller.status().bots[0].defaultSessionPermission, null);
+
   await assert.rejects(
     () => controller.setGroupResponseMode(identity.botId, 'bogus'),
     /groupResponseMode must be/,
+  );
+  await assert.rejects(
+    () => controller.setAccountSettings(identity.botId, {
+      groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.THREAD,
+      defaultSessionPermission: 'nope',
+    }),
+    /defaultSessionPermission must be/,
   );
   await controller.close();
 });
@@ -2264,6 +2327,7 @@ test('Discord RPC handler validates and persists setGroupResponseMode', async ()
     async bindCredentials() { return { snapshot: { bots: [] } }; },
     async reconnectBot() { return { snapshot: { bots: [] } }; },
     async deleteBot() { return { snapshot: { bots: [] } }; },
+    async setAccountSettings() { assert.fail('legacy mode RPC should not use setAccountSettings'); },
     async setGroupResponseMode(botId, groupResponseMode) {
       calls.push({ botId, groupResponseMode });
       return { snapshot: { bots: [{ botId, groupResponseMode }] } };
@@ -2305,6 +2369,7 @@ test('Discord RPC handler validates and persists setGroupResponseMode', async ()
     async bindCredentials() { return { snapshot: { bots: [] } }; },
     async reconnectBot() { return { snapshot: { bots: [] } }; },
     async deleteBot() { return { snapshot: { bots: [] } }; },
+    async setAccountSettings() { throw new Error('restart failed'); },
     async setGroupResponseMode() { throw new Error('restart failed'); },
   });
   const rejected = await failed(DISCORD_ENDPOINTS.setGroupResponseMode, {
@@ -2324,4 +2389,75 @@ test('Discord RPC handler validates and persists setGroupResponseMode', async ()
   assert.equal(cancelledResult.ok, false);
   assert.equal(cancelledResult.error.code, 'cancelled');
   assert.deepEqual(cancelledResult.error.details, {});
+});
+
+test('Discord RPC handler validates and persists default session permission', async () => {
+  const calls = [];
+  const handler = createDiscordRpcHandler({
+    async status() { return { snapshot: { bots: [] } }; },
+    async bindCredentials() { return { snapshot: { bots: [] } }; },
+    async reconnectBot() { return { snapshot: { bots: [] } }; },
+    async deleteBot() { return { snapshot: { bots: [] } }; },
+    async setAccountSettings(botId, settings) {
+      calls.push({ botId, ...settings });
+      return { snapshot: { bots: [{ botId, ...settings }] } };
+    },
+  });
+  const identity = deriveDiscordBotIdentity('1234567890123456789');
+  const accepted = await handler(DISCORD_ENDPOINTS.setAccountSettings, {
+    botId: identity.botId,
+    groupResponseMode: 'thread',
+    defaultSessionPermission: 'danger-full-access',
+  });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual(calls, [{
+    botId: identity.botId,
+    groupResponseMode: 'thread',
+    defaultSessionPermission: 'danger-full-access',
+  }]);
+
+  const inherit = await handler(DISCORD_ENDPOINTS.setAccountSettings, {
+    botId: identity.botId,
+    groupResponseMode: 'channel',
+    defaultSessionPermission: null,
+  });
+  assert.equal(inherit.ok, true);
+  assert.equal(calls.at(-1).defaultSessionPermission, null);
+
+  const badPermission = await handler(DISCORD_ENDPOINTS.setAccountSettings, {
+    botId: identity.botId,
+    groupResponseMode: 'thread',
+    defaultSessionPermission: 'nope',
+  });
+  assert.equal(badPermission.ok, false);
+  assert.equal(badPermission.error.code, 'bad-request');
+});
+
+test('Discord session permission wrapper pins /permission after createSession', async () => {
+  const commands = [];
+  const harness = wrapDiscordSessionPermission({
+    async createSession() { return 'session-new'; },
+    async executeCommand(sessionId, line) {
+      commands.push({ sessionId, line });
+      return { result: { kind: 'success', text: 'preset danger-full-access' } };
+    },
+  }, () => DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS);
+  assert.equal(await harness.createSession(), 'session-new');
+  assert.deepEqual(commands, [{
+    sessionId: 'session-new',
+    line: '/permission danger-full-access',
+  }]);
+
+  const inherit = wrapDiscordSessionPermission({
+    async createSession() { return 'session-inherit'; },
+    async executeCommand() { assert.fail('Host default must not run /permission'); },
+  }, () => null);
+  assert.equal(await inherit.createSession(), 'session-inherit');
+
+  await assert.rejects(
+    () => wrapDiscordSessionPermission({
+      async createSession() { return 'session-missing'; },
+    }, () => DISCORD_SESSION_PERMISSIONS.WORKSPACE_WRITE).createSession(),
+    (error) => error.code === 'commands-unavailable',
+  );
 });

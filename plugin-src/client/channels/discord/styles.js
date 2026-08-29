@@ -10,6 +10,8 @@ const CSS = String.raw`
 .ddc-groupStatus { min-width: 0; display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .ddc-groupBadge { flex: none; padding: 3px 8px; border-radius: 999px; color: #4752c4; background: #eef0ff; font-size: 11px; font-weight: 700; }
 .ddc-groupBadge[data-mode="channel"] { color: #a15c00; background: #fff3d6; }
+.ddc-groupBadge[data-permission="danger-full-access"] { color: #a15c00; background: #fff3d6; }
+.ddc-groupBadge[data-permission="workspace-write"] { color: #4752c4; background: #eef0ff; }
 .ddc-groupHelp { position: relative; display: inline-flex; flex: none; }
 .ddc-groupHelpButton { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; border: 1px solid color-mix(in srgb, #5865f2 28%, var(--dsw-alias-border-l2, #dfe1e5)); border-radius: 50%; color: #4752c4; background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 12px; line-height: 1; font-weight: 750; cursor: help; transition: border-color .15s ease, color .15s ease, background .15s ease, box-shadow .15s ease; }
 .ddc-groupHelpButton:hover { border-color: #5865f2; color: #3a44a8; background: #eef0ff; }

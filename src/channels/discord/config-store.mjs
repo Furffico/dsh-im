@@ -7,6 +7,9 @@ import {
 import {
   normalizeDiscordGroupResponseMode,
 } from './group-response-mode.mjs';
+import {
+  normalizeDiscordSessionPermission,
+} from './session-permission.mjs';
 
 const IDENTITY_OPTIONS = Object.freeze({
   botPrefix: 'discord',
@@ -15,11 +18,15 @@ const IDENTITY_OPTIONS = Object.freeze({
 
 function normalizeDiscordBotExtension(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const hasGroupResponseMode = Object.hasOwn(value, 'groupResponseMode');
-  if (!hasGroupResponseMode) return {};
-  return {
-    groupResponseMode: normalizeDiscordGroupResponseMode(value.groupResponseMode),
-  };
+  const extension = {};
+  if (Object.hasOwn(value, 'groupResponseMode')) {
+    extension.groupResponseMode = normalizeDiscordGroupResponseMode(value.groupResponseMode);
+  }
+  if (Object.hasOwn(value, 'defaultSessionPermission')) {
+    const permission = normalizeDiscordSessionPermission(value.defaultSessionPermission);
+    if (permission) extension.defaultSessionPermission = permission;
+  }
+  return extension;
 }
 
 export function deriveDiscordBotIdentity(platformId) {

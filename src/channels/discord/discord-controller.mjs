@@ -6,6 +6,10 @@ import {
   isDiscordGroupResponseMode,
   normalizeDiscordGroupResponseMode,
 } from './group-response-mode.mjs';
+import {
+  isDiscordSessionPermission,
+  normalizeDiscordSessionPermission,
+} from './session-permission.mjs';
 
 export class DiscordController extends TokenBotController {
   #configStore;
@@ -30,18 +34,41 @@ export class DiscordController extends TokenBotController {
         return {
           ...bot,
           groupResponseMode: normalizeDiscordGroupResponseMode(config?.groupResponseMode),
+          defaultSessionPermission: normalizeDiscordSessionPermission(
+            config?.defaultSessionPermission,
+          ),
         };
       }),
     };
   }
 
-  async setGroupResponseMode(botId, groupResponseMode) {
+  async setAccountSettings(botId, {
+    groupResponseMode,
+    defaultSessionPermission,
+  } = {}) {
     if (!isDiscordGroupResponseMode(groupResponseMode)) {
       throw new TypeError('Discord groupResponseMode must be "thread" or "channel"');
     }
-    return this.mutateBotConfig(botId, (config) => ({
-      ...config,
-      groupResponseMode: normalizeDiscordGroupResponseMode(groupResponseMode),
-    }));
+    const permission = normalizeDiscordSessionPermission(defaultSessionPermission);
+    if (defaultSessionPermission != null && !isDiscordSessionPermission(permission)) {
+      throw new TypeError('Discord defaultSessionPermission must be "workspace-write" or "danger-full-access"');
+    }
+    return this.mutateBotConfig(botId, (config) => {
+      const next = {
+        ...config,
+        groupResponseMode: normalizeDiscordGroupResponseMode(groupResponseMode),
+      };
+      if (permission) next.defaultSessionPermission = permission;
+      else delete next.defaultSessionPermission;
+      return next;
+    });
+  }
+
+  async setGroupResponseMode(botId, groupResponseMode) {
+    const current = this.#configStore.get(botId);
+    return this.setAccountSettings(botId, {
+      groupResponseMode,
+      defaultSessionPermission: current?.defaultSessionPermission ?? null,
+    });
   }
 }

@@ -5,4 +5,9 @@ export default {
     'The Discord Gateway Intents are misconfigured. Please check the Bot settings in the Developer Portal.',
   'Discord机器人': 'Discord Bot',
   ' Gateway 长连接': ' Gateway long-lived connection',
+  '当前 Harness 暂不支持从机器人设置会话权限。':
+    'The current Harness cannot set session permission from the bot.',
+  '当前 Harness 未注册 /permission 命令。':
+    'The current Harness has not registered the /permission command.',
+  '会话权限设置失败。': 'Could not set the session permission.',
 };

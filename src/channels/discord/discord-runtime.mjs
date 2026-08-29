@@ -13,6 +13,10 @@ import {
   DISCORD_GROUP_RESPONSE_MODES,
   normalizeDiscordGroupResponseMode,
 } from './group-response-mode.mjs';
+import {
+  normalizeDiscordSessionPermission,
+  wrapDiscordSessionPermission,
+} from './session-permission.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
@@ -535,9 +539,16 @@ export class DiscordRuntime {
       throw new TypeError('DiscordRuntime requires config, token, Harness, and state');
     }
     if (typeof createWebSocket !== 'function') throw new TypeError('DiscordRuntime requires WebSocket');
-    this.#config = config;
+    this.#config = {
+      ...config,
+      groupResponseMode: normalizeDiscordGroupResponseMode(config.groupResponseMode),
+      defaultSessionPermission: normalizeDiscordSessionPermission(config.defaultSessionPermission),
+    };
     this.#token = token;
-    this.#harness = harness;
+    this.#harness = wrapDiscordSessionPermission(
+      harness,
+      () => this.#config.defaultSessionPermission,
+    );
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
     this.#logger = logger;
@@ -558,6 +569,9 @@ export class DiscordRuntime {
       ...this.#config,
       ...config,
       groupResponseMode: normalizeDiscordGroupResponseMode(config.groupResponseMode),
+      defaultSessionPermission: Object.hasOwn(config, 'defaultSessionPermission')
+        ? normalizeDiscordSessionPermission(config.defaultSessionPermission)
+        : this.#config.defaultSessionPermission,
     };
   }
 

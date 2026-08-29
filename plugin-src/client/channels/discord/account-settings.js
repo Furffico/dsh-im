@@ -5,9 +5,17 @@ import {
   DISCORD_GROUP_RESPONSE_MODES,
   normalizeDiscordGroupResponseMode,
 } from '../../../../src/channels/discord/group-response-mode.mjs';
+import {
+  DISCORD_SESSION_PERMISSIONS,
+  normalizeDiscordSessionPermission,
+} from '../../../../src/channels/discord/session-permission.mjs';
 
 function modeFor(account) {
   return normalizeDiscordGroupResponseMode(account?.groupResponseMode);
+}
+
+function permissionFor(account) {
+  return normalizeDiscordSessionPermission(account?.defaultSessionPermission) ?? '';
 }
 
 const MODE_OPTIONS = [
@@ -23,16 +31,46 @@ const MODE_OPTIONS = [
   },
 ];
 
-export function DiscordGroupResponseSettings({ account, busy = false, onSave }) {
+const PERMISSION_OPTIONS = [
+  {
+    value: '',
+    title: '跟随 Host 默认',
+    description: '新建会话沿用 Host Settings 里的 permission 默认值。',
+  },
+  {
+    value: DISCORD_SESSION_PERMISSIONS.WORKSPACE_WRITE,
+    title: 'Workspace Write',
+    description: '工作区内可写，更宽权限需要审批。',
+  },
+  {
+    value: DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS,
+    title: 'Full access',
+    description: '无文件沙箱限制，也不弹出审批。',
+  },
+];
+
+function permissionBadge(permission) {
+  if (permission === DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS) return '已生效：Full access';
+  if (permission === DISCORD_SESSION_PERMISSIONS.WORKSPACE_WRITE) return '已生效：Workspace Write';
+  return '已生效：跟随 Host 默认';
+}
+
+export function DiscordAccountSettings({ account, busy = false, onSave }) {
   const currentMode = modeFor(account);
-  const helpId = React.useId();
+  const currentPermission = permissionFor(account);
+  const modeHelpId = React.useId();
+  const permissionHelpId = React.useId();
   const [selectedMode, setSelectedMode] = React.useState(currentMode);
+  const [selectedPermission, setSelectedPermission] = React.useState(currentPermission);
   const [error, setError] = React.useState(null);
 
   React.useEffect(() => {
     setSelectedMode(currentMode);
+    setSelectedPermission(currentPermission);
     setError(null);
-  }, [currentMode]);
+  }, [currentMode, currentPermission]);
+
+  const dirty = selectedMode !== currentMode || selectedPermission !== currentPermission;
 
   const save = async (event) => {
     event.preventDefault();
@@ -41,13 +79,20 @@ export function DiscordGroupResponseSettings({ account, busy = false, onSave }) 
       setError('请选择「线程模式」或「频道直接回复」。');
       return;
     }
+    if (selectedPermission && !Object.values(DISCORD_SESSION_PERMISSIONS).includes(selectedPermission)) {
+      setError('请选择「跟随 Host 默认」、「Workspace Write」或「Full access」。');
+      return;
+    }
     try {
       if (typeof onSave !== 'function') {
-        throw new Error('Discord 群响应模式设置暂不可用。');
+        throw new Error('Discord 账号设置暂不可用。');
       }
-      await onSave({ groupResponseMode: selectedMode });
+      await onSave({
+        groupResponseMode: selectedMode,
+        defaultSessionPermission: selectedPermission || null,
+      });
     } catch (caught) {
-      setError(caught?.message ?? 'Discord 群响应模式保存失败。');
+      setError(caught?.message ?? 'Discord 账号设置保存失败。');
     }
   };
 
@@ -62,10 +107,10 @@ export function DiscordGroupResponseSettings({ account, busy = false, onSave }) 
             type: 'button',
             className: 'ddc-groupHelpButton',
             'aria-label': '查看 Discord 群响应模式说明',
-            'aria-describedby': helpId,
+            'aria-describedby': modeHelpId,
           }, h('span', { 'aria-hidden': 'true' }, '?')),
           h('span', {
-            id: helpId,
+            id: modeHelpId,
             className: 'ddc-groupTooltip',
             role: 'tooltip',
           },
@@ -86,7 +131,57 @@ export function DiscordGroupResponseSettings({ account, busy = false, onSave }) 
           value: option.value,
           checked: selectedMode === option.value,
           disabled: busy,
-          onChange: () => { setSelectedMode(option.value); setError(null); },
+          onChange: (event) => {
+            setSelectedMode(event.target.value);
+            setError(null);
+          },
+        }),
+        h('span', { className: 'ddc-groupOptionBody' },
+          h('strong', null, option.title),
+          h('small', null, option.description))))),
+    h('div', { className: 'ddc-groupHeading' },
+      h('strong', null, '新建会话权限'),
+      h('span', { className: 'ddc-groupStatus' },
+        h('span', {
+          className: 'ddc-groupBadge',
+          'data-permission': currentPermission || 'host',
+        }, permissionBadge(currentPermission)),
+        h('span', { className: 'ddc-groupHelp' },
+          h('button', {
+            type: 'button',
+            className: 'ddc-groupHelpButton',
+            'aria-label': '查看 Discord 新建会话权限说明',
+            'aria-describedby': permissionHelpId,
+          }, h('span', { 'aria-hidden': 'true' }, '?')),
+          h('span', {
+            id: permissionHelpId,
+            className: 'ddc-groupTooltip',
+            role: 'tooltip',
+          },
+            h('span', { className: 'ddc-groupTooltipItem' },
+              h('strong', null, '跟随 Host 默认'),
+              h('span', null, '不覆盖 Host Settings 的 permission 默认值。')),
+            h('span', { className: 'ddc-groupTooltipItem' },
+              h('strong', null, 'Workspace Write'),
+              h('span', null, '对应 /permission workspace-write。')),
+            h('span', { className: 'ddc-groupTooltipItem' },
+              h('strong', null, 'Full access'),
+              h('span', null, '对应 /permission danger-full-access。只影响新建会话；已有会话发送 /new 后再发普通消息才会生效。')))))),
+    h('div', { className: 'ddc-groupField', role: 'radiogroup', 'aria-label': 'Discord 新建会话权限' },
+      PERMISSION_OPTIONS.map((option) => h('label', {
+        key: option.value || 'host',
+        className: 'ddc-groupOption',
+      },
+        h('input', {
+          type: 'radio',
+          name: 'defaultSessionPermission',
+          value: option.value,
+          checked: selectedPermission === option.value,
+          disabled: busy,
+          onChange: (event) => {
+            setSelectedPermission(event.target.value);
+            setError(null);
+          },
         }),
         h('span', { className: 'ddc-groupOptionBody' },
           h('strong', null, option.title),
@@ -97,6 +192,8 @@ export function DiscordGroupResponseSettings({ account, busy = false, onSave }) 
         type: 'submit',
         className: 'ddt-button',
         'data-kind': 'secondary',
-        disabled: busy || selectedMode === currentMode,
-      }, busy ? '正在保存…' : '保存群响应模式')));
+        disabled: busy || !dirty,
+      }, busy ? '正在保存…' : '保存设置')));
 }
+
+export { DiscordAccountSettings as DiscordGroupResponseSettings };

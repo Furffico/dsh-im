@@ -8,12 +8,16 @@ import TestRenderer from 'react-test-renderer';
 
 import {
   DiscordAccountCard,
+  DiscordAccountSettings,
   DiscordGroupResponseSettings,
   DiscordSettingsTab,
 } from '../../../plugin-src/client/channels/discord/index.js';
 import {
   DISCORD_GROUP_RESPONSE_MODES,
 } from '../../../src/channels/discord/group-response-mode.mjs';
+import {
+  DISCORD_SESSION_PERMISSIONS,
+} from '../../../src/channels/discord/session-permission.mjs';
 
 const { act } = TestRenderer;
 
@@ -68,6 +72,8 @@ test('Discord account card defaults to the thread-mode badge', () => {
   }));
   assert.match(markup, /已生效：线程模式/);
   assert.match(markup, /aria-label="Discord 群响应模式"/);
+  assert.match(markup, /已生效：跟随 Host 默认/);
+  assert.match(markup, /aria-label="Discord 新建会话权限"/);
 });
 
 test('Discord group response settings reflects the saved mode and persists edits', async () => {
@@ -83,17 +89,16 @@ test('Discord group response settings reflects the saved mode and persists edits
     }));
   });
   const radios = renderer.root.findAllByType('input').filter((node) => node.props.type === 'radio');
-  assert.equal(radios.length, 2);
+  assert.equal(radios.length, 5);
   assert.equal(radios[0].props.checked, true);
   assert.equal(radios[1].props.checked, false);
 
   await act(async () => {
     radios[1].props.onChange({ target: { value: DISCORD_GROUP_RESPONSE_MODES.CHANNEL } });
   });
-  assert.match(
-    renderer.root.findByProps({ className: 'ddc-groupBadge' }).children.join(''),
-    /已生效：线程模式/,
-  );
+  const modeBadge = renderer.root.findAllByProps({ className: 'ddc-groupBadge' })
+    .find((node) => node.props['data-mode']);
+  assert.match(modeBadge.children.join(''), /已生效：线程模式/);
 
   const channelView = renderToStaticMarkup(React.createElement(DiscordGroupResponseSettings, {
     account: {
@@ -115,8 +120,35 @@ test('Discord group response settings reflects the saved mode and persists edits
   await act(async () => {
     await submitView.root.findByType('form').props.onSubmit({ preventDefault() {} });
   });
-  assert.deepEqual(saved, [{ groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL }]);
+  assert.deepEqual(saved, [{
+    groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.CHANNEL,
+    defaultSessionPermission: null,
+  }]);
   submitView.unmount();
+});
+
+test('Discord account settings shows the saved default session permission', () => {
+  const inheritView = renderToStaticMarkup(React.createElement(DiscordAccountSettings, {
+    account: {
+      botId: 'discord_test',
+      groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.THREAD,
+      defaultSessionPermission: null,
+    },
+    onSave: async () => {},
+  }));
+  assert.match(inheritView, /已生效：跟随 Host 默认/);
+  assert.match(inheritView, /name="defaultSessionPermission"[^]*value="danger-full-access"/);
+
+  const fullAccessView = renderToStaticMarkup(React.createElement(DiscordAccountSettings, {
+    account: {
+      botId: 'discord_test',
+      groupResponseMode: DISCORD_GROUP_RESPONSE_MODES.THREAD,
+      defaultSessionPermission: DISCORD_SESSION_PERMISSIONS.DANGER_FULL_ACCESS,
+    },
+    onSave: async () => {},
+  }));
+  assert.match(fullAccessView, /已生效：Full access/);
+  assert.match(fullAccessView, /data-permission="danger-full-access"/);
 });
 
 test('Discord group response settings help tooltip lists both modes', () => {
@@ -129,6 +161,8 @@ test('Discord group response settings help tooltip lists both modes', () => {
   }));
   assert.match(markup, />线程模式（默认）<\/strong>/);
   assert.match(markup, />频道直接回复<\/strong>/);
+  assert.match(markup, />新建会话权限<\/strong>/);
+  assert.match(markup, />Full access<\/strong>/);
   assert.match(markup, /保持 v0\.16\.0 及更早版本的旧行为/);
   assert.match(markup, /为本次对话自动创建 Thread/);
 });

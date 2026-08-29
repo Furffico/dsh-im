@@ -264,6 +264,29 @@ const EN = Object.freeze({
   '请选择 Agent Preset。': 'Choose an Agent Preset.',
   'Agent Preset 无效。': 'The Agent Preset is invalid.',
   'Agent Preset 不存在或不可用。': 'The Agent Preset does not exist or is unavailable.',
+  '新建会话权限': 'Default session permission',
+  '查看 Discord 新建会话权限说明': 'View Discord default session permission help',
+  '已生效：跟随 Host 默认': 'Active: follow Host default',
+  '已生效：Workspace Write': 'Active: Workspace Write',
+  '已生效：Full access': 'Active: Full access',
+  '新建会话沿用 Host Settings 里的 permission 默认值。':
+    'New sessions keep the permission default from Host Settings.',
+  '工作区内可写，更宽权限需要审批。':
+    'Writable inside the workspace; wider access requires approval.',
+  '无文件沙箱限制，也不弹出审批。':
+    'No file-sandbox restriction and no approval prompts.',
+  '不覆盖 Host Settings 的 permission 默认值。':
+    'Does not override the permission default from Host Settings.',
+  '对应 /permission workspace-write。': 'Maps to /permission workspace-write.',
+  '对应 /permission danger-full-access。只影响新建会话；已有会话发送 /new 后再发普通消息才会生效。':
+    'Maps to /permission danger-full-access. This affects only new sessions. If the current chat already has a session, send /new, then send a regular message to apply it.',
+  '请选择「跟随 Host 默认」、「Workspace Write」或「Full access」。':
+    'Choose Follow the Host default, Workspace Write, or Full access.',
+  'Discord 账号设置暂不可用。': 'Discord account settings are unavailable.',
+  'Discord 账号设置保存失败。': 'Could not save Discord account settings.',
+  '保存设置': 'Save settings',
+  '请选择群响应模式，以及「跟随 Host 默认」、「Workspace Write」或「Full access」。':
+    'Choose a group response mode and Follow the Host default, Workspace Write, or Full access.',
   '尚未检查': 'Not checked yet',
   '刚刚': 'Just now',
   '检查连接': 'Check connection',
