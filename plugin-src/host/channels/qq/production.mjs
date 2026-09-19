@@ -16,6 +16,7 @@ import {
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
 import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
+import { wrapForDebug } from '../shared/force-debug-logger.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -41,7 +42,10 @@ export async function createProductionController(ctx, config = {}, internals = {
   const Runtime = internals.Runtime ?? QqRuntime;
   const QrAuth = internals.QrAuth ?? QqQrAuth;
   const createSupervisor = internals.createConnectionSupervisor ?? createConnectionSupervisor;
-  const logger = typeof ctx.logger === 'function' ? ctx.logger('dsh-im:qq') : (ctx.logger ?? console);
+  const logger = wrapForDebug(
+    typeof ctx.logger === 'function' ? ctx.logger('dsh-im:qq') : (ctx.logger ?? console),
+    'dsh-im:qq',
+  );
   const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const paths = pluginPaths(config);
   const configStore = await new ConfigStore(paths.config).load();

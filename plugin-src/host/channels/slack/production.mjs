@@ -15,6 +15,7 @@ import {
 import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
 import { createTokenConnectionSupervisor } from '../shared/connection-supervisor.mjs';
 import { pluginPaths } from '../shared/production.mjs';
+import { wrapForDebug } from '../shared/force-debug-logger.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -29,8 +30,11 @@ export async function createProductionController(ctx, config = {}, internals = {
   const ResolvedController = internals.Controller ?? SlackController;
   const ResolvedRuntime = internals.Runtime ?? SlackRuntime;
   const createSupervisor = internals.createConnectionSupervisor ?? createTokenConnectionSupervisor;
-  const logger = typeof ctx.logger === 'function'
-    ? ctx.logger('dsh-im:slack') : (ctx.logger ?? console);
+  const logger = wrapForDebug(
+    typeof ctx.logger === 'function'
+      ? ctx.logger('dsh-im:slack') : (ctx.logger ?? console),
+    'dsh-im:slack',
+  );
   const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const paths = pluginPaths(config, 'slack');
   const configStore = await new ResolvedConfigStore(paths.config).load();

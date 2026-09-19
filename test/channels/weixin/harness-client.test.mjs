@@ -191,6 +191,32 @@ test('HarnessClient forwards a per-session agent preset override', async () => {
   });
 });
 
+test('HarnessClient renames a session and ignores Discord channel labels on create', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/default-workspace',
+  });
+  const calls = [];
+  client.ensureRunning = async () => true;
+  client.workspaceId = async () => 'workspace-one';
+  client.rpc = async (method, value) => {
+    calls.push([method, value]);
+    if (method === 'session.create') return { sessionId: 'session-one' };
+    if (method === 'session.rename') return { title: value.title, seq: 1 };
+    throw new Error(`unexpected ${method}`);
+  };
+
+  assert.equal(await client.createSession({ sessionChannelLabel: 'gaming' }), 'session-one');
+  assert.deepEqual(await client.renameSession('session-one', 'discord:gaming:20260829-1746'), {
+    title: 'discord:gaming:20260829-1746',
+    seq: 1,
+  });
+  assert.deepEqual(calls, [
+    ['session.create', { workspaceId: 'workspace-one' }],
+    ['session.rename', { sessionId: 'session-one', title: 'discord:gaming:20260829-1746' }],
+  ]);
+});
+
 test('HarnessClient lists only absolute workspace paths', async () => {
   const client = new HarnessClient({
     baseUrl: 'http://127.0.0.1:3080',

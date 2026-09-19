@@ -704,7 +704,13 @@ export async function runModelCommand(text, harness, state, key, options = {}) {
           || typeof state?.setSession !== 'function') {
           throw new TypeError('Harness cannot create a conversation session');
         }
-        const sessionId = await harness.createSession(requestOptions);
+        const sessionId = await harness.createSession({
+          ...requestOptions,
+          ...(options.sessionCreateOptions && typeof options.sessionCreateOptions === 'object'
+            && !Array.isArray(options.sessionCreateOptions)
+            ? options.sessionCreateOptions
+            : {}),
+        });
         if (typeof sessionId !== 'string' || !sessionId) {
           throw new TypeError('Harness returned an invalid session id');
         }

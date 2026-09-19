@@ -1,3 +1,5 @@
+import { discordSessionTitle } from './session-title.mjs';
+
 export const DISCORD_SESSION_PERMISSIONS = Object.freeze({
   WORKSPACE_WRITE: 'workspace-write',
   DANGER_FULL_ACCESS: 'danger-full-access',
@@ -21,7 +23,7 @@ export function discordPermissionCommand(permission) {
   return normalized ? `/permission ${normalized}` : null;
 }
 
-export function wrapDiscordSessionPermission(harness, getDefaultPermission) {
+export function wrapDiscordSessionPermission(harness, getDefaultPermission, { now } = {}) {
   if (!harness || typeof harness !== 'object') {
     throw new TypeError('Harness is required');
   }
@@ -29,6 +31,7 @@ export function wrapDiscordSessionPermission(harness, getDefaultPermission) {
     throw new TypeError('getDefaultPermission must be a function');
   }
   if (typeof harness.createSession !== 'function') return harness;
+  const clock = typeof now === 'function' ? now : () => new Date();
   return new Proxy(harness, {
     get(target, property, receiver) {
       if (property !== 'createSession') {
@@ -36,28 +39,42 @@ export function wrapDiscordSessionPermission(harness, getDefaultPermission) {
         return typeof value === 'function' ? value.bind(target) : value;
       }
       return async (options = {}) => {
-        const sessionId = await target.createSession(options);
+        const { sessionChannelLabel, ...createOptions } = options;
+        const sessionId = await target.createSession(createOptions);
         const line = discordPermissionCommand(getDefaultPermission());
-        if (!line) return sessionId;
-        if (typeof target.executeCommand !== 'function') {
-          const error = new Error('当前 Harness 暂不支持从机器人设置会话权限。');
-          error.code = 'commands-unavailable';
-          throw error;
+        if (line) {
+          if (typeof target.executeCommand !== 'function') {
+            const error = new Error('当前 Harness 暂不支持从机器人设置会话权限。');
+            error.code = 'commands-unavailable';
+            throw error;
+          }
+          const execution = await target.executeCommand(sessionId, line, createOptions);
+          if (execution === undefined) {
+            const error = new Error('当前 Harness 未注册 /permission 命令。');
+            error.code = 'commands-unavailable';
+            throw error;
+          }
+          if (execution?.result?.kind === 'error') {
+            const error = new Error(
+              typeof execution.result.text === 'string' && execution.result.text.trim()
+                ? execution.result.text.trim()
+                : '会话权限设置失败。',
+            );
+            error.code = 'discord-permission-failed';
+            throw error;
+          }
         }
-        const execution = await target.executeCommand(sessionId, line, options);
-        if (execution === undefined) {
-          const error = new Error('当前 Harness 未注册 /permission 命令。');
-          error.code = 'commands-unavailable';
-          throw error;
-        }
-        if (execution?.result?.kind === 'error') {
-          const error = new Error(
-            typeof execution.result.text === 'string' && execution.result.text.trim()
-              ? execution.result.text.trim()
-              : '会话权限设置失败。',
-          );
-          error.code = 'discord-permission-failed';
-          throw error;
+        const label = typeof sessionChannelLabel === 'string' ? sessionChannelLabel.trim() : '';
+        if (label && typeof target.renameSession === 'function') {
+          try {
+            await target.renameSession(
+              sessionId,
+              discordSessionTitle({ channelLabel: label, now: clock() }),
+              createOptions,
+            );
+          } catch {
+            // Keep the new Session even if the explicit title cannot be pinned.
+          }
         }
         return sessionId;
       };

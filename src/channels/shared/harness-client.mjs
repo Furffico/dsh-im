@@ -883,7 +883,7 @@ export class HarnessClient {
   }
 
   async createSession(options = {}) {
-    const { agentPreset: requestedPreset, ...rpcOptions } = options;
+    const { agentPreset: requestedPreset, sessionChannelLabel: _sessionChannelLabel, ...rpcOptions } = options;
     await this.ensureRunning(rpcOptions);
     const workspaceId = await this.workspaceId(rpcOptions);
     const payload = { workspaceId };
@@ -891,6 +891,19 @@ export class HarnessClient {
     if (agentPreset != null) payload.agentPreset = agentPreset;
     const created = await this.rpc('session.create', payload, 30_000, rpcOptions);
     return created.sessionId;
+  }
+
+  async renameSession(sessionId, title, options = {}) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
+    if (typeof title !== 'string' || !title.trim()) throw new TypeError('title is required');
+    await this.ensureRunning(options);
+    const value = await this.rpc('session.rename', { sessionId, title }, 30_000, options);
+    if (!value || typeof value !== 'object'
+      || typeof value.title !== 'string' || !value.title
+      || !Number.isInteger(value.seq) || value.seq < 0) {
+      throw new Error('Harness returned an invalid response for session.rename');
+    }
+    return value;
   }
 
   async executeCommand(sessionId, line, options = {}) {

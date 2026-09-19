@@ -6,6 +6,7 @@ import { OfficeController } from '../../../../src/channels/office/office-control
 import { OfficeRuntime } from '../../../../src/channels/office/office-runtime.mjs';
 import { HarnessClient } from '../../../../src/channels/shared/harness-client.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
+import { wrapForDebug } from '../shared/force-debug-logger.mjs';
 
 export function officePaths(config = {}) {
   const dshHome = resolve(config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
@@ -21,7 +22,10 @@ export async function createProductionController(ctx, config = {}, internals = {
   const ResolvedHarness = internals.HarnessClient ?? HarnessClient;
   const paths = officePaths(config);
   const configStore = await new Store(paths.config).load();
-  const logger = typeof ctx.logger === 'function' ? ctx.logger('dsh-im:office') : (ctx.logger ?? console);
+  const logger = wrapForDebug(
+    typeof ctx.logger === 'function' ? ctx.logger('dsh-im:office') : (ctx.logger ?? console),
+    'dsh-im:office',
+  );
   const createHarness = internals.createHarness ?? (({ workspace }) => new ResolvedHarness({
     ...connection,
     workspace,

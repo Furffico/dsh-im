@@ -16,6 +16,7 @@ import {
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
 import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
 import { createTokenConnectionSupervisor } from '../shared/connection-supervisor.mjs';
+import { wrapForDebug } from '../shared/force-debug-logger.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -40,8 +41,11 @@ function pluginPaths(config) {
 
 export async function createProductionController(ctx, config = {}, internals = {}) {
   const connection = harnessConnection(ctx, config);
-  const logger = typeof ctx.logger === 'function'
-    ? ctx.logger('dsh-im:whatsapp') : (ctx.logger ?? console);
+  const logger = wrapForDebug(
+    typeof ctx.logger === 'function'
+      ? ctx.logger('dsh-im:whatsapp') : (ctx.logger ?? console),
+    'dsh-im:whatsapp',
+  );
   const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const ConfigStore = internals.ConfigStore ?? WhatsappConfigStore;
   const StateStore = internals.StateStore ?? WhatsappStateStore;

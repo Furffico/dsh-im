@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { createTokenConnectionSupervisor } from './connection-supervisor.mjs';
+import { wrapForDebug } from './force-debug-logger.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -42,8 +43,12 @@ export async function createTokenProductionController(ctx, config, internals, de
     throw new TypeError(`dsh-im ${channel} runtimeOptions must return an object`);
   }
   const createSupervisor = internals.createConnectionSupervisor ?? createTokenConnectionSupervisor;
-  const logger = typeof ctx.logger === 'function'
-    ? ctx.logger(`dsh-im:${channel}`) : (ctx.logger ?? console);
+  const logger = wrapForDebug(
+    typeof ctx.logger === 'function'
+      ? ctx.logger(`dsh-im:${channel}`)
+      : (ctx.logger ?? console),
+    `dsh-im:${channel}`,
+  );
   const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const paths = pluginPaths(config, channel);
   const configStore = await new ResolvedConfigStore(paths.config).load();

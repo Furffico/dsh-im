@@ -142,6 +142,7 @@ export class TextHarnessBridge {
   #commandTasks = new Set();
   #approvals;
   #batches = new BatchInputManager();
+  #sessionCreateOptions;
 
   constructor({
     descriptor,
@@ -153,6 +154,7 @@ export class TextHarnessBridge {
     logger = console,
     replyTimeoutMs = 600_000,
     signal,
+    sessionCreateOptions,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -166,10 +168,22 @@ export class TextHarnessBridge {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#signal = signal;
+    this.#sessionCreateOptions = typeof sessionCreateOptions === 'function'
+      ? sessionCreateOptions
+      : null;
     this.#approvals = new HarnessApprovalQueue({
       label: descriptor.key,
       logger,
     });
+  }
+
+  #createSessionOptions(message) {
+    const extra = this.#sessionCreateOptions?.(message);
+    const base = this.#signal ? { signal: this.#signal } : {};
+    if (!extra || typeof extra !== 'object' || Array.isArray(extra)) {
+      return Object.keys(base).length > 0 ? base : undefined;
+    }
+    return { ...base, ...extra };
   }
 
   get status() {
@@ -432,6 +446,7 @@ export class TextHarnessBridge {
           pendingInteraction: this.#pendingInteractions.has(key)
             || this.#approvals.hasPending(key),
           control: { owner: this, key },
+          sessionCreateOptions: this.#sessionCreateOptions?.(message),
         },
       );
       if (result?.stopped) {
@@ -641,7 +656,7 @@ export class TextHarnessBridge {
         key: conversationKey,
         text,
         content,
-        createOptions: this.#signal ? { signal: this.#signal } : undefined,
+        createOptions: this.#createSessionOptions(message),
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
           timeoutMs: this.#replyTimeoutMs,

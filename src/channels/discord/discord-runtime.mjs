@@ -17,6 +17,7 @@ import {
   normalizeDiscordSessionPermission,
   wrapDiscordSessionPermission,
 } from './session-permission.mjs';
+import { discordSessionChannelLabel } from './session-title.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
@@ -105,11 +106,17 @@ function withConversationRoute(normalized, channel, botId, {
   fromSourceMessage = false,
   fallback = null,
   notice = null,
+  channels = null,
 } = {}) {
   const channelId = String(channel?.id ?? normalized.conversationId);
   const thread = isThreadChannel(channel);
   const managed = thread && String(channel?.owner_id ?? '') === String(botId);
   const parentId = thread && channel?.parent_id ? String(channel.parent_id) : channelId;
+  const conversationRoute = {
+    peerId: parentId,
+    ...(thread ? { threadId: channelId, managed } : {}),
+    ...(fallback ? { fallback } : {}),
+  };
   return {
     ...normalized,
     conversationId: channelId,
@@ -123,11 +130,14 @@ function withConversationRoute(normalized, channel, botId, {
       ...(notice ? { notice } : {}),
     },
     connectionTestTarget: { channelId },
-    conversationRoute: {
-      peerId: parentId,
-      ...(thread ? { threadId: channelId, managed } : {}),
-      ...(fallback ? { fallback } : {}),
-    },
+    conversationRoute,
+    sessionChannelLabel: discordSessionChannelLabel({
+      kind: normalized.kind,
+      conversationId: channelId,
+      conversationRoute,
+      channel,
+      channels,
+    }),
   };
 }
 
@@ -259,16 +269,26 @@ export function normalizeDiscordMessage(message, botId, { fetchImpl = fetch } = 
 export async function resolveDiscordMessageRoute(message, botId, {
   api,
   channel,
+  channels,
   fetchImpl = fetch,
   signal,
   onChannel,
   groupResponseMode,
 } = {}) {
   const normalized = normalizeDiscordMessage(message, botId, { fetchImpl });
-  if (!normalized || normalized.senderIsBot) return normalized;
+  if (!normalized) return normalized;
+  // Discord accepts messages from other bots. Reset senderIsBot so the shared
+  // bridge guard does not drop them. Bot↔bot loops are explicitly accepted.
+  normalized.senderIsBot = false;
   signal?.throwIfAborted();
+  const routeOptions = { channels };
   if (normalized.kind === 'direct') {
-    return withConversationRoute(normalized, { id: normalized.conversationId, type: 1 }, botId);
+    return withConversationRoute(
+      normalized,
+      channels?.get?.(normalized.conversationId) ?? { id: normalized.conversationId, type: 1 },
+      botId,
+      routeOptions,
+    );
   }
   if (!api || typeof api.getChannel !== 'function') {
     throw new TypeError('Discord route resolution requires the Discord API');
@@ -279,13 +299,14 @@ export async function resolveDiscordMessageRoute(message, botId, {
     signal,
   }), onChannel);
   if (isThreadChannel(sourceChannel)) {
-    return withConversationRoute(normalized, sourceChannel, botId);
+    return withConversationRoute(normalized, sourceChannel, botId, routeOptions);
   }
-  if (!normalized.addressed) return withConversationRoute(normalized, sourceChannel, botId);
+  if (!normalized.addressed) return withConversationRoute(normalized, sourceChannel, botId, routeOptions);
 
   const sourceType = Number(sourceChannel?.type);
   if (sourceType !== GUILD_TEXT && sourceType !== GUILD_ANNOUNCEMENT) {
     return withConversationRoute(normalized, sourceChannel, botId, {
+      ...routeOptions,
       fallback: 'unsupported-channel',
       notice: groupResponseMode === DISCORD_GROUP_RESPONSE_MODES.CHANNEL
         ? null
@@ -296,7 +317,7 @@ export async function resolveDiscordMessageRoute(message, botId, {
   // 'channel' mode 回复源频道,跳过自动建线程 —— 与 v0.16.0 行为一致。
   if (normalizeDiscordGroupResponseMode(groupResponseMode)
     === DISCORD_GROUP_RESPONSE_MODES.CHANNEL) {
-    return withConversationRoute(normalized, sourceChannel, botId);
+    return withConversationRoute(normalized, sourceChannel, botId, routeOptions);
   }
 
   signal?.throwIfAborted();
@@ -324,7 +345,10 @@ export async function resolveDiscordMessageRoute(message, botId, {
       throw threadCreateUncertain(recoveryError);
     }
     if (recovered) {
-      return withConversationRoute(normalized, recovered, botId, { fromSourceMessage: true });
+      return withConversationRoute(normalized, recovered, botId, {
+        ...routeOptions,
+        fromSourceMessage: true,
+      });
     }
     if (signal?.aborted) throw signal.reason ?? error;
     if (uncertainThreadCreate(error)) {
@@ -332,11 +356,15 @@ export async function resolveDiscordMessageRoute(message, botId, {
       throw threadCreateUncertain(error);
     }
     return withConversationRoute(normalized, sourceChannel, botId, {
+      ...routeOptions,
       fallback: 'thread-create-failed',
       notice: '无法创建 Thread，已直接在当前频道回复。',
     });
   }
-  return withConversationRoute(normalized, created, botId, { fromSourceMessage: true });
+  return withConversationRoute(normalized, created, botId, {
+    ...routeOptions,
+    fromSourceMessage: true,
+  });
 }
 
 export class DiscordBotClient {
@@ -534,6 +562,7 @@ export class DiscordRuntime {
     createApi = (options) => new DiscordApi(options),
     createWebSocket = (url) => new WebSocket(url),
     random = Math.random,
+    now,
   }) {
     if (!config || !token || !harness || !state) {
       throw new TypeError('DiscordRuntime requires config, token, Harness, and state');
@@ -548,6 +577,7 @@ export class DiscordRuntime {
     this.#harness = wrapDiscordSessionPermission(
       harness,
       () => this.#config.defaultSessionPermission,
+      { now },
     );
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
@@ -630,6 +660,7 @@ export class DiscordRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         signal: controller.signal,
+        channels: this.#channels,
       });
       let timer;
       try {
@@ -806,6 +837,7 @@ export class DiscordRuntime {
       const pendingRoute = resolveDiscordMessageRoute(message, this.#config.platformId, {
         api: this.#api,
         channel: this.#channels.get(String(message.channel_id)),
+        channels: this.#channels,
         signal: this.#abortController?.signal,
         onChannel: (resolved) => this.#rememberChannel(resolved),
         groupResponseMode: this.#config.groupResponseMode,

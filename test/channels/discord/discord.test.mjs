@@ -24,6 +24,10 @@ import {
   wrapDiscordSessionPermission,
 } from '../../../src/channels/discord/session-permission.mjs';
 import {
+  discordSessionTitle,
+  sanitizeDiscordChannelLabel,
+} from '../../../src/channels/discord/session-title.mjs';
+import {
   DiscordApi,
   inspectDiscordToken,
   validDiscordToken,
@@ -974,6 +978,7 @@ test('Discord routes mentioned text and announcement messages into native thread
       name: fixture.content,
     });
     assert.equal(route.conversationId, message.id);
+    assert.equal(route.sessionChannelLabel, message.channel_id);
     assert.deepEqual(route.replyTarget, { channelId: message.id });
     assert.deepEqual(route.reactionTarget, {
       channelId: message.channel_id,
@@ -1002,6 +1007,7 @@ test('Discord keeps direct-message routing stable without a channel lookup', asy
     },
   });
   assert.equal(route.conversationId, '222222222222222242');
+  assert.equal(route.sessionChannelLabel, '222222222222222242');
   assert.deepEqual(route.conversationRoute, { peerId: '222222222222222242' });
   assert.deepEqual(route.replyTarget, {
     channelId: '222222222222222242',
@@ -1035,6 +1041,7 @@ test('Discord reuses all native thread types and only relaxes mentions for bot-o
         },
       });
       assert.equal(route.conversationId, channelId);
+      assert.equal(route.sessionChannelLabel, '222222222222222299');
       assert.equal(route.addressed, managed);
       assert.equal(route.requiresMention, !managed);
       assert.deepEqual(route.replyTarget, {
@@ -1077,6 +1084,7 @@ test('Discord recovers an already-created thread after an uncertain or duplicate
     },
   });
   assert.equal(starts, 1);
+  assert.equal(route.sessionChannelLabel, message.channel_id);
   assert.equal(route.conversationRoute.threadId, message.id);
   assert.equal(route.conversationRoute.managed, true);
   assert.deepEqual(route.replyTarget, { channelId: message.id });
@@ -1545,6 +1553,7 @@ test('Discord runtime keeps one isolated Session per managed thread and reuses i
       nextSession += 1;
       return sessionId;
     },
+    async renameSession() {},
     sessionExists: async () => true,
     async ask(sessionId, text, options) {
       asks.push({ sessionId, text, files: options?.files?.length ?? 0 });
@@ -1583,7 +1592,7 @@ test('Discord runtime keeps one isolated Session per managed thread and reuses i
       s: 2,
       d: {
         id: '444444444444444444',
-        channels: [{ id: parentChannelId, type: 0 }],
+        channels: [{ id: parentChannelId, type: 0, name: 'gaming' }],
         threads: [{
           id: unrelatedThreadId,
           type: 11,
@@ -2460,4 +2469,114 @@ test('Discord session permission wrapper pins /permission after createSession', 
     }, () => DISCORD_SESSION_PERMISSIONS.WORKSPACE_WRITE).createSession(),
     (error) => error.code === 'commands-unavailable',
   );
+});
+
+test('Discord session wrapper names a new Session after the channel and creation time', async () => {
+  assert.equal(sanitizeDiscordChannelLabel('#gaming:qa', '1'), 'gaming-qa');
+  const renamed = [];
+  const now = new Date(2026, 7, 29, 17, 46);
+  const harness = wrapDiscordSessionPermission({
+    async createSession(options) {
+      assert.equal(Object.hasOwn(options, 'sessionChannelLabel'), false);
+      return 'session-named';
+    },
+    async executeCommand() { assert.fail('Host default must not run /permission'); },
+    async renameSession(sessionId, title, options) {
+      renamed.push({ sessionId, title, options });
+      return { title, seq: 1 };
+    },
+  }, () => null, { now: () => now });
+
+  assert.equal(await harness.createSession({
+    signal: AbortSignal.timeout(1_000),
+    sessionChannelLabel: 'gaming',
+  }), 'session-named');
+  assert.deepEqual(renamed, [{
+    sessionId: 'session-named',
+    title: discordSessionTitle({ channelLabel: 'gaming', now }),
+    options: { signal: renamed[0].options.signal },
+  }]);
+  assert.equal(renamed[0].title, 'discord:gaming:20260829-1746');
+});
+
+test('Discord runtime names a new Session from the parent channel', async (t) => {
+  const botId = '1234567890123456789';
+  const parentChannelId = '222222222222222270';
+  const sessions = new Map();
+  const renamed = [];
+  const now = new Date(2026, 7, 29, 17, 46);
+  let socket;
+  const runtime = new DiscordRuntime({
+    config: { botId: 'discord_named', platformId: botId, name: 'Harness Discord' },
+    token: TOKEN,
+    now: () => now,
+    harness: {
+      ensureRunning: async () => true,
+      async createSession() { return 'session-named'; },
+      async renameSession(sessionId, title) { renamed.push({ sessionId, title }); },
+      sessionExists: async () => true,
+      ask: async () => 'answer',
+    },
+    state: {
+      sessionFor: (key) => sessions.get(key) ?? null,
+      async setSession(key, sessionId) { sessions.set(key, sessionId); },
+      hasSeen: () => false,
+      async markSeen() {},
+    },
+    createApi: () => ({
+      getCurrentUser: async () => ({ id: botId, bot: true }),
+      getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }),
+      async getChannel() { assert.fail('cached channel expected'); },
+      async startThreadFromMessage({ messageId, channelId }) {
+        return { id: messageId, type: 11, parent_id: channelId, owner_id: botId };
+      },
+      async sendTyping() {},
+      async createMessage() { return { id: '888888888888888801' }; },
+      async editMessage({ messageId }) { return { id: messageId }; },
+    }),
+    createWebSocket: () => {
+      socket = new FakeSocket();
+      queueMicrotask(() => socket.emit('message', {
+        data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }),
+      }));
+      return socket;
+    },
+    random: () => 0.5,
+    logger: { warn() {}, error(...args) { assert.fail(args.join(' ')); } },
+  });
+  t.after(async () => { await runtime.stop(); });
+  await runtime.start();
+  socket.emit('message', {
+    data: JSON.stringify({
+      op: 0,
+      t: 'GUILD_CREATE',
+      s: 2,
+      d: {
+        id: '444444444444444444',
+        channels: [{ id: parentChannelId, type: 0, name: 'gaming' }],
+        threads: [],
+      },
+    }),
+  });
+  const messageId = '111111111111111180';
+  socket.emit('message', {
+    data: JSON.stringify({
+      op: 0,
+      t: 'MESSAGE_CREATE',
+      s: 3,
+      d: {
+        id: messageId,
+        channel_id: parentChannelId,
+        guild_id: '444444444444444444',
+        author: { id: '333333333333333330', bot: false },
+        mentions: [{ id: botId }],
+        content: `<@${botId}> first task`,
+      },
+    }),
+  });
+  await eventually(() => runtime.status.messagesReplied === 1);
+  assert.deepEqual(renamed, [{
+    sessionId: 'session-named',
+    title: 'discord:gaming:20260829-1746',
+  }]);
 });

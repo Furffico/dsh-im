@@ -1,4 +1,5 @@
 import { TextHarnessBridge, createTextBridgeStatus } from '../shared/text-harness-bridge.mjs';
+import { discordSessionChannelLabel } from './session-title.mjs';
 
 export const DISCORD_DESCRIPTOR = Object.freeze({
   key: 'discord',
@@ -8,8 +9,21 @@ export const DISCORD_DESCRIPTOR = Object.freeze({
 });
 
 export class DiscordHarnessBridge extends TextHarnessBridge {
-  constructor(options) {
-    super({ descriptor: DISCORD_DESCRIPTOR, ...options });
+  constructor(options = {}) {
+    const { channels, sessionCreateOptions, ...rest } = options;
+    super({
+      descriptor: DISCORD_DESCRIPTOR,
+      ...rest,
+      sessionCreateOptions: sessionCreateOptions ?? ((message) => ({
+        sessionChannelLabel: message.sessionChannelLabel
+          ?? discordSessionChannelLabel({
+            kind: message.kind,
+            conversationId: message.conversationId,
+            conversationRoute: message.conversationRoute,
+            channels,
+          }),
+      })),
+    });
   }
 }
 

@@ -10,6 +10,7 @@ import { apply as applyWeixin } from './channels/weixin/index.mjs';
 import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
 import { installOutboundArtifactTool } from '../../src/channels/shared/semantic/artifact.mjs';
 import { setImHostLanguage } from '../../src/channels/shared/i18n.mjs';
+import { wrapForDebug } from './channels/shared/force-debug-logger.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
 
 export const name = 'dsh-im-host';
@@ -63,9 +64,10 @@ export function createImHostPlugin(internals = {}) {
       } else {
         installOutboundArtifactTool(ctx);
       }
-      const logger = typeof ctx?.logger === 'function'
+      const baseLogger = typeof ctx?.logger === 'function'
         ? ctx.logger(name)
         : (ctx?.logger ?? console);
+      const logger = wrapForDebug(baseLogger, name);
       if (ctx?.connection?.rpc) {
         try {
           startUpdate(ctx);
