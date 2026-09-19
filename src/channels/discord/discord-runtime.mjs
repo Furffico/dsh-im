@@ -3,6 +3,7 @@ import { fetchFileStream } from '../shared/file-download.mjs';
 import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
+import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { DiscordApi, DISCORD_MAX_MESSAGE_ATTACHMENTS } from './discord-api.mjs';
 import {
   discordAttachmentCaptions,
@@ -78,7 +79,10 @@ function gatewayCloseError(code) {
 
 function stripBotMention(text, botId) {
   if (typeof text !== 'string') return '';
-  return text.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
+  return text
+    .split(`<@${botId}>`).join('')
+    .split(`<@!${botId}>`).join('')
+    .trim();
 }
 
 function cleanThreadName(message, botId) {
@@ -170,7 +174,7 @@ async function sendThreadUncertainNotice(api, normalized, signal) {
     await api.createMessage({
       channelId: normalized.replyTarget.channelId,
       replyToMessageId: normalized.replyTarget.replyToMessageId,
-      content: 'Thread 创建结果暂时无法确认。若已创建，请在对应 Thread 中重试；若未创建，请稍后重新 @机器人。',
+      content: t('Thread 创建结果暂时无法确认。若已创建，请在对应 Thread 中重试；若未创建，请稍后重新 @机器人。'),
       signal,
     });
   } catch (error) {
@@ -227,12 +231,101 @@ function discordFileSource(attachment, fetchImpl) {
   };
 }
 
-export function normalizeDiscordMessage(message, botId, { fetchImpl = fetch } = {}) {
+function discordReplyAttachment(attachment) {
+  if (!attachment || typeof attachment !== 'object') return null;
+  const mediaType = typeof attachment.content_type === 'string'
+    ? attachment.content_type.split(';', 1)[0].trim().toLowerCase() : '';
+  const kind = mediaType.startsWith('image/') ? 'image'
+    : mediaType.startsWith('audio/') ? 'audio'
+      : mediaType.startsWith('video/') ? 'video' : 'file';
+  const name = typeof attachment.filename === 'string' && attachment.filename
+    ? attachment.filename : undefined;
+  return { kind, ...(name ? { name } : {}) };
+}
+
+function discordReplySnapshot(message, fallbackMessageId) {
+  if (!message || typeof message !== 'object') return null;
+  const messageId = typeof message.id === 'string' && message.id
+    ? message.id : fallbackMessageId;
+  const authorId = typeof message.author?.id === 'string' && message.author.id
+    ? message.author.id : undefined;
+  const authorName = [message.member?.nick, message.author?.global_name, message.author?.username]
+    .find((value) => typeof value === 'string' && value.trim());
+  const attachments = Array.isArray(message.attachments)
+    ? message.attachments.map(discordReplyAttachment).filter(Boolean)
+    : [];
+  if (Array.isArray(message.sticker_items)) {
+    attachments.push(...message.sticker_items.map((sticker) => ({
+      kind: 'image',
+      ...(typeof sticker?.name === 'string' && sticker.name ? { name: sticker.name } : {}),
+    })));
+  }
+  return {
+    ...(messageId ? { messageId: String(messageId) } : {}),
+    ...(authorId ? { authorId } : {}),
+    ...(authorName ? { authorName } : {}),
+    content: typeof message.content === 'string' ? message.content : '',
+    attachments,
+  };
+}
+
+function discordReplyReference(message, loadReply) {
+  const channelId = String(message?.channel_id ?? '');
+  const referenceId = typeof message?.message_reference?.message_id === 'string'
+    && message.message_reference.message_id
+    ? message.message_reference.message_id : undefined;
+  const referenceChannelId = message?.message_reference?.channel_id;
+  if (referenceChannelId !== undefined && String(referenceChannelId) !== channelId) {
+    return {
+      ...(referenceId ? { messageId: referenceId } : {}),
+      unavailableReason: 'not-found',
+    };
+  }
+  if (Object.hasOwn(message ?? {}, 'referenced_message')) {
+    if (message.referenced_message === null) {
+      return {
+        ...(referenceId ? { messageId: referenceId } : {}),
+        unavailableReason: 'deleted',
+      };
+    }
+    if (message.referenced_message && typeof message.referenced_message === 'object') {
+      const snapshotId = typeof message.referenced_message.id === 'string'
+        && message.referenced_message.id ? message.referenced_message.id : undefined;
+      if (String(message.referenced_message.channel_id ?? '') !== channelId
+        || !snapshotId || (referenceId && snapshotId !== referenceId)) {
+        return {
+          ...(referenceId ? { messageId: referenceId } : {}),
+          unavailableReason: 'not-found',
+        };
+      }
+      return discordReplySnapshot(message.referenced_message, referenceId) ?? undefined;
+    }
+  }
+  if (!referenceId) return undefined;
+  if (typeof loadReply !== 'function') {
+    return { messageId: referenceId, unavailableReason: 'not-delivered' };
+  }
+  return {
+    messageId: referenceId,
+    load: async ({ signal } = {}) => {
+      const referenced = await loadReply({ channelId, messageId: referenceId, signal });
+      if (!referenced || String(referenced.id ?? '') !== referenceId
+        || String(referenced.channel_id ?? '') !== channelId) return null;
+      return discordReplySnapshot(referenced, referenceId);
+    },
+  };
+}
+
+export function normalizeDiscordMessage(message, botId, {
+  fetchImpl = fetch,
+  loadReply,
+} = {}) {
   if (!message?.id || !message?.channel_id || !message?.author?.id
     || Number(message.type) === 21) return null;
   const direct = !message.guild_id;
   const addressed = direct
     || message.mentions?.some((mention) => String(mention?.id) === String(botId));
+  const replyTo = discordReplyReference(message, loadReply);
   return {
     messageId: String(message.id),
     senderId: String(message.author.id),
@@ -253,6 +346,7 @@ export function normalizeDiscordMessage(message, botId, { fetchImpl = fetch } = 
     files: Array.isArray(message.attachments)
       ? message.attachments.map((attachment) => discordFileSource(attachment, fetchImpl)).filter(Boolean)
       : [],
+    ...(replyTo ? { replyTo } : {}),
     addressed,
     replyTarget: {
       channelId: String(message.channel_id),
@@ -275,7 +369,12 @@ export async function resolveDiscordMessageRoute(message, botId, {
   onChannel,
   groupResponseMode,
 } = {}) {
-  const normalized = normalizeDiscordMessage(message, botId, { fetchImpl });
+  const normalized = normalizeDiscordMessage(message, botId, {
+    fetchImpl,
+    loadReply: typeof api?.getMessage === 'function'
+      ? (options) => api.getMessage(options)
+      : undefined,
+  });
   if (!normalized) return normalized;
   // Discord accepts messages from other bots. Reset senderIsBot so the shared
   // bridge guard does not drop them. Bot↔bot loops are explicitly accepted.
@@ -525,6 +624,7 @@ export class DiscordRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #connectTimeoutMs;
@@ -556,6 +656,7 @@ export class DiscordRuntime {
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
@@ -581,6 +682,7 @@ export class DiscordRuntime {
     );
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
@@ -612,6 +714,22 @@ export class DiscordRuntime {
       throw error;
     }
     return this.#bridge.sendConnectionTest(text);
+  }
+
+  async sendProactiveText(target, text, options = {}) {
+    if (!this.#status.ready || !this.#bridge) {
+      const error = new Error('Discord bot is not connected');
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    const channelId = typeof target?.route?.channelId === 'string'
+      ? target.route.channelId.trim() : '';
+    if (target?.kind !== 'channel' || !channelId) {
+      const error = new TypeError('Invalid Discord proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    return this.#bridge.sendProactiveText({ channelId }, text, options);
   }
 
   async start() {
@@ -656,6 +774,7 @@ export class DiscordRuntime {
         harness: this.#harness,
         state: this.#state,
         contextEnhancement: this.#contextEnhancement,
+        accessPolicy: this.#accessPolicy,
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
@@ -828,6 +947,24 @@ export class DiscordRuntime {
   async #acceptMessage(message, bridge) {
     const messageId = String(message?.id ?? '');
     if (!messageId || this.#state.hasSeen(messageId)) return;
+    const preflight = normalizeDiscordMessage(message, this.#config.platformId);
+    let accessDecision;
+    if (preflight?.kind === 'group' && preflight.addressed === true
+      && preflight.senderIsBot !== true) {
+      accessDecision = evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: 'group',
+        senderIds: [preflight.senderId],
+        text: preflight.content,
+        hasImages: preflight.images.length > 0,
+        hasFiles: preflight.files.length > 0,
+      });
+      if (!accessDecision.allowed) {
+        // Let the shared bridge apply its normal silent/command-denial behavior,
+        // but do so against the source channel before creating a Thread.
+        await bridge.accept(preflight, { accessDecision });
+        return;
+      }
+    }
     let route = this.#routing.get(messageId);
     if (!route) {
       const contextSnapshot = captureContextEnhancement(
@@ -850,7 +987,12 @@ export class DiscordRuntime {
     }
     try {
       const normalized = await route.pendingRoute;
-      if (normalized) await bridge.accept(normalized, { contextSnapshot: route.contextSnapshot });
+      if (normalized) {
+        await bridge.accept(normalized, {
+          contextSnapshot: route.contextSnapshot,
+          ...(accessDecision ? { accessDecision } : {}),
+        });
+      }
     } catch (error) {
       if (error?.code === 'discord-thread-create-uncertain') {
         await this.#state.markSeen(messageId);

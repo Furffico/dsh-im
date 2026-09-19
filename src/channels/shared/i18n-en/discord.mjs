@@ -10,4 +10,6 @@ export default {
   '当前 Harness 未注册 /permission 命令。':
     'The current Harness has not registered the /permission command.',
   '会话权限设置失败。': 'Could not set the session permission.',
+  'Thread 创建结果暂时无法确认。若已创建，请在对应 Thread 中重试；若未创建，请稍后重新 @机器人。':
+    'The Thread creation result cannot be confirmed yet. If the Thread was created, retry inside it; if it was not, mention the bot again shortly.',
 };

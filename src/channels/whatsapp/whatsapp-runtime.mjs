@@ -3,17 +3,17 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   areJidsSameUser,
   downloadMediaMessage,
+  jidDecode,
   normalizeMessageContent,
 } from '@whiskeysockets/baileys';
 
-import { splitMessageText } from '../shared/editable-message-stream.mjs';
+import { createEditableMessageStream, splitMessageText } from '../shared/editable-message-stream.mjs';
 import { t } from '../shared/i18n.mjs';
 import { ImagePromptError } from '../shared/image-prompt.mjs';
 import { trackOutboundArtifactProviderPromise } from '../shared/semantic/artifact.mjs';
 import { createWhatsappBridgeStatus, WhatsappHarnessBridge } from './whatsapp-bridge.mjs';
 import {
   WHATSAPP_ACCESS_MODES,
-  normalizeWhatsappAccessPolicy,
 } from './config-store.mjs';
 import { createWhatsappWebSession } from './whatsapp-web-session.mjs';
 
@@ -21,6 +21,7 @@ const IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'ima
 const DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 15_000;
 const WHATSAPP_MEDIA_UPLOAD_TIMEOUT_MS = 120_000;
+const WHATSAPP_TEXT_LIMIT = 4_000;
 const MESSAGE_WRAPPER_KEYS = [
   'ephemeralMessage',
   'viewOnceMessage',
@@ -37,6 +38,36 @@ const VIEW_ONCE_WRAPPER_KEYS = new Set([
   'viewOnceMessageV2',
   'viewOnceMessageV2Extension',
 ]);
+const WHATSAPP_ACCESS_POLICY_USER_SERVERS = new Set([
+  's.whatsapp.net',
+  'c.us',
+  'lid',
+  'hosted',
+  'hosted.lid',
+]);
+
+function normalizeWhatsappAccessPolicyId(value) {
+  if (typeof value !== 'string') return null;
+  const candidate = value.trim();
+  if (/^\+?\d+$/.test(candidate)) {
+    return `${candidate.replace(/^\+/, '')}@s.whatsapp.net`;
+  }
+  const decoded = jidDecode(candidate);
+  if (!decoded || !/^\d+$/.test(decoded.user)
+    || !WHATSAPP_ACCESS_POLICY_USER_SERVERS.has(decoded.server)) return null;
+  return candidate;
+}
+
+export function whatsappAccessPolicyIdsEqual(left, right) {
+  const normalizedLeft = normalizeWhatsappAccessPolicyId(left);
+  const normalizedRight = normalizeWhatsappAccessPolicyId(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  try {
+    return areJidsSameUser(normalizedLeft, normalizedRight) === true;
+  } catch {
+    return false;
+  }
+}
 
 function hasViewOnceWrapper(content) {
   let current = content;
@@ -64,6 +95,60 @@ function messageText(content) {
     ?? content?.videoMessage?.caption
     ?? content?.documentMessage?.caption
     ?? '';
+}
+
+function whatsappReplyAttachment(kind, media, fallbackName) {
+  if (!media || typeof media !== 'object') return null;
+  const name = typeof media.fileName === 'string' && media.fileName
+    ? media.fileName : typeof fallbackName === 'string' && fallbackName
+      ? fallbackName : undefined;
+  return { kind, ...(name ? { name } : {}) };
+}
+
+function whatsappReplyAttachments(content) {
+  const attachments = [];
+  if (content?.imageMessage) {
+    attachments.push(whatsappReplyAttachment('image', content.imageMessage));
+  }
+  if (content?.documentMessage) {
+    const mediaType = typeof content.documentMessage.mimetype === 'string'
+      ? content.documentMessage.mimetype.toLowerCase() : '';
+    attachments.push(whatsappReplyAttachment(
+      mediaType.startsWith('image/') ? 'image' : 'file',
+      content.documentMessage,
+    ));
+  }
+  if (content?.audioMessage) {
+    attachments.push(whatsappReplyAttachment('audio', content.audioMessage));
+  }
+  if (content?.videoMessage) {
+    attachments.push(whatsappReplyAttachment('video', content.videoMessage));
+  }
+  if (content?.stickerMessage) {
+    const mediaType = typeof content.stickerMessage.mimetype === 'string'
+      ? content.stickerMessage.mimetype.toLowerCase() : '';
+    attachments.push(whatsappReplyAttachment(
+      mediaType.startsWith('video/') || content.stickerMessage.isAnimated === true
+        ? 'video' : 'image',
+      content.stickerMessage,
+    ));
+  }
+  return attachments.filter(Boolean);
+}
+
+function whatsappReplyReference(context) {
+  if (!context?.quotedMessage || typeof context.quotedMessage !== 'object') return undefined;
+  const content = normalizeMessageContent(context.quotedMessage);
+  const messageId = typeof context.stanzaId === 'string' && context.stanzaId
+    ? context.stanzaId : undefined;
+  const authorId = typeof context.participant === 'string' && context.participant
+    ? context.participant : undefined;
+  return {
+    ...(messageId ? { messageId } : {}),
+    ...(authorId ? { authorId } : {}),
+    content: messageText(content),
+    attachments: whatsappReplyAttachments(content),
+  };
 }
 
 function mediaSize(value) {
@@ -230,6 +315,7 @@ export function normalizeWhatsappMessage(message, accountJid, {
     && areJidsSameUser(context.participant, accountJid);
   const image = whatsappImageSource(message, content, download, { viewOnce });
   const file = whatsappFileSource(message, content, download);
+  const replyTo = whatsappReplyReference(context);
   return {
     messageId: `${remoteJid}:${messageId}`,
     providerMessageId: messageId,
@@ -244,6 +330,7 @@ export function normalizeWhatsappMessage(message, accountJid, {
       || typeof content?.extendedTextMessage?.text === 'string',
     images: image ? [image] : [],
     files: file ? [file] : [],
+    ...(replyTo ? { replyTo } : {}),
     addressed: !group || fromMe || mentioned || replyToSelf,
     selfChat,
     replyTarget: { jid: remoteJid, quoted: message, selfChat },
@@ -355,47 +442,95 @@ export class WhatsappBotClient {
   #socket;
   #outboundIds;
   #signal;
+  #abortController = new AbortController();
   #mediaUploadTimeoutMs;
+  #logger;
   #typingTimers = new Map();
+  #streams = new Set();
 
   constructor(socket, outboundIds, {
     signal,
     mediaUploadTimeoutMs = WHATSAPP_MEDIA_UPLOAD_TIMEOUT_MS,
+    logger = console,
   } = {}) {
     this.#socket = socket;
     this.#outboundIds = outboundIds;
-    this.#signal = signal;
+    this.#signal = signal
+      ? AbortSignal.any([signal, this.#abortController.signal])
+      : this.#abortController.signal;
     this.#mediaUploadTimeoutMs = mediaUploadTimeoutMs;
+    this.#logger = logger;
   }
 
   async sendText(target, text) {
     await this.#stopTyping(target.jid);
     const providerMessageIds = [];
-    for (const [index, chunk] of splitMessageText(text, 4_000).entries()) {
-      const messageId = randomBytes(10).toString('hex').toUpperCase();
-      const options = {
-        ...(index === 0 && target.quoted ? { quoted: target.quoted } : {}),
-        messageId,
-      };
-      // Linked-account group messages are valid inbound prompts in open mode.
-      // Reserve our own id before dispatch so an early local echo cannot loop
-      // back through the bridge as another owner-authored group prompt.
-      if (typeof this.#outboundIds.reserve === 'function') {
-        this.#outboundIds.reserve(messageId);
-      } else {
-        this.#outboundIds.remember(messageId);
-      }
-      const result = await this.#socket.sendMessage(
-        target.jid,
-        { text: chunk },
-        options,
-      );
-      this.#outboundIds.remember(result?.key?.id);
-      if (typeof result?.key?.id === 'string' && result.key.id) {
-        providerMessageIds.push(result.key.id);
-      }
+    for (const [index, chunk] of splitMessageText(text, WHATSAPP_TEXT_LIMIT).entries()) {
+      const result = await this.#sendTextMessage(target, chunk, { quote: index === 0 });
+      providerMessageIds.push(result.key.id);
     }
     return { providerMessageIds };
+  }
+
+  async #sendTextMessage(target, text, { edit, quote = true } = {}) {
+    this.#signal?.throwIfAborted();
+    const messageId = randomBytes(10).toString('hex').toUpperCase();
+    // Reserve both the outgoing envelope and the edited message before dispatch:
+    // linked-account group and self-chat echoes can arrive before send settles.
+    const reserve = (id) => {
+      if (typeof this.#outboundIds.reserve === 'function') this.#outboundIds.reserve(id);
+      else this.#outboundIds.remember(id);
+    };
+    reserve(messageId);
+    if (edit) reserve(edit.id);
+    const pending = this.#socket.sendMessage(
+      target.jid,
+      { text, ...(edit ? { edit } : {}) },
+      { ...(quote && !edit && target.quoted ? { quoted: target.quoted } : {}), messageId },
+    );
+    const result = await waitWithSignal(pending, this.#signal);
+    this.#outboundIds.remember(result?.key?.id);
+    return {
+      ...result,
+      key: { remoteJid: target.jid, fromMe: true, id: messageId, ...result?.key },
+    };
+  }
+
+  async openStream(target) {
+    let messageKey;
+    const stream = createEditableMessageStream({
+      limit: WHATSAPP_TEXT_LIMIT,
+      updateIntervalMs: 1_000,
+      create: async (text) => {
+        const message = await this.#sendTextMessage(target, text);
+        messageKey = message.key;
+        return messageKey.id;
+      },
+      // Baileys edits need the original full message key, not an edit envelope id.
+      edit: async (_messageId, text) => this.#sendTextMessage(target, text, { edit: messageKey }),
+      sendRemainder: (text) => this.#sendTextMessage(target, text, { quote: false }),
+      messageIdForResult: (message) => message?.key?.id,
+      logger: this.#logger,
+    });
+    const finish = stream.finish.bind(stream);
+    const cancel = stream.cancel.bind(stream);
+    stream.finish = async (text) => {
+      try {
+        return await finish(text);
+      } finally {
+        this.#streams.delete(stream);
+        await this.#stopTyping(target.jid);
+      }
+    };
+    stream.cancel = () => {
+      cancel();
+      this.#streams.delete(stream);
+      return this.#stopTyping(target.jid);
+    };
+    await stream.start();
+    this.#signal.throwIfAborted();
+    this.#streams.add(stream);
+    return stream;
   }
 
   async sendFile(target, file) {
@@ -507,8 +642,10 @@ export class WhatsappBotClient {
   }
 
   async close() {
+    this.#abortController.abort();
+    const stoppingStreams = [...this.#streams].map((stream) => stream.cancel());
     const jids = [...this.#typingTimers.keys()];
-    await Promise.allSettled(jids.map((jid) => this.#stopTyping(jid)));
+    await Promise.allSettled([...stoppingStreams, ...jids.map((jid) => this.#stopTyping(jid))]);
   }
 
   async #stopTyping(jid, sendPaused = true) {
@@ -538,12 +675,11 @@ export class WhatsappRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #connectTimeoutMs;
   #mediaUploadTimeoutMs;
-  #accessMode;
-  #allowedPrivateNumbers;
   #createSession;
   #status = createWhatsappRuntimeStatus();
   #abortController = null;
@@ -558,6 +694,7 @@ export class WhatsappRuntime {
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 30_000,
@@ -572,6 +709,7 @@ export class WhatsappRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
@@ -583,19 +721,10 @@ export class WhatsappRuntime {
       WHATSAPP_MEDIA_UPLOAD_TIMEOUT_MS,
     );
     this.#createSession = createSession;
-    this.setAccessPolicy(config);
   }
 
   get status() {
     return structuredClone(this.#status);
-  }
-
-  setAccessPolicy(value) {
-    const policy = normalizeWhatsappAccessPolicy(value);
-    this.#accessMode = policy.accessMode;
-    this.#allowedPrivateNumbers = new Set(policy.allowedNumbers);
-    this.#config = { ...this.#config, ...policy };
-    return policy;
   }
 
   async start() {
@@ -636,14 +765,6 @@ export class WhatsappRuntime {
           });
           if (!message || outboundIds.has(message.providerMessageId) || !this.#bridge) return;
           this.#status.lastCheckedAt = Date.now();
-          if (!whatsappInboundAllowed(message, {
-            accessMode: this.#accessMode,
-            allowedNumbers: this.#allowedPrivateNumbers,
-          })) {
-            this.#status.messagesRejected += 1;
-            this.#status.lastRejectedAt = new Date().toISOString();
-            return;
-          }
           await this.#bridge.accept(message);
         },
         onDisconnect: ({ error }) => {
@@ -671,6 +792,7 @@ export class WhatsappRuntime {
       const client = new WhatsappBotClient(session.socket, outboundIds, {
         signal: controller.signal,
         mediaUploadTimeoutMs: this.#mediaUploadTimeoutMs,
+        logger: this.#logger,
       });
       this.#client = client;
       this.#bridge = new WhatsappHarnessBridge({
@@ -678,6 +800,14 @@ export class WhatsappRuntime {
         harness: this.#harness,
         state: this.#state,
         contextEnhancement: this.#contextEnhancement,
+        accessPolicy: this.#accessPolicy ? {
+          botId: this.#accessPolicy.botId,
+          getSettings: (...args) => this.#accessPolicy.getSettings(...args),
+          ...(typeof this.#accessPolicy.isPrivileged === 'function' ? {
+            isPrivileged: (...args) => this.#accessPolicy.isPrivileged(...args),
+          } : {}),
+          equals: whatsappAccessPolicyIdsEqual,
+        } : undefined,
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
@@ -717,6 +847,25 @@ export class WhatsappRuntime {
       selfChat: true,
     }, text);
     return { sent: true };
+  }
+
+  async sendProactiveText(target, text, { signal } = {}) {
+    const jid = typeof target?.route?.jid === 'string' ? target.route.jid.trim() : '';
+    const validUser = target?.kind === 'user'
+      && /^[^@\s]+@(s\.whatsapp\.net|lid)$/.test(jid);
+    const validGroup = target?.kind === 'group' && /^[^@\s]+@g\.us$/.test(jid);
+    if (!validUser && !validGroup) {
+      const error = new TypeError('Invalid WhatsApp proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    if (!this.#status.ready || !this.#client) {
+      const error = new Error(t('WhatsApp机器人尚未连接'));
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    signal?.throwIfAborted();
+    return this.#client.sendText({ jid }, text);
   }
 
   async stop() {

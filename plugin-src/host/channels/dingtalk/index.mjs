@@ -1,25 +1,21 @@
 import { createProductionController } from './production.mjs';
-import { installDingtalkRpc } from './rpc.mjs';
+import { createDingtalkRpcHandler, installDingtalkRpc, DINGTALK_RPC_CHANNEL } from './rpc.mjs';
+import { installProductionChannel } from '../shared/startup.mjs';
 
 export const name = 'dsh-dingtalk-host';
-export const inject = ['connection', 'credentials', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'credentials', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installDingtalkRpc(ctx, config.controller, config.rpcOptions, config.rpcAuthority);
   }
 
-  const production = await createProductionController(ctx, config, config.internals);
-  const disposeRpc = installDingtalkRpc(
-    ctx,
-    production.controller,
-    config.rpcOptions,
-    config.rpcAuthority,
-  );
-  ctx.effect(() => async () => {
-    await production.close();
-  }, 'dsh-dingtalk: close bot connections');
-  return disposeRpc;
+  return installProductionChannel(ctx, config, {
+    channel: 'dingtalk',
+    rpcChannel: DINGTALK_RPC_CHANNEL,
+    createProduction: () => createProductionController(ctx, config, config.internals),
+    createHandler: controller => createDingtalkRpcHandler(controller, config.rpcOptions),
+  });
 }
 
 export function createDingtalkHostPlugin(config) {

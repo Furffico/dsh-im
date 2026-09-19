@@ -29,8 +29,21 @@ export function sanitizeDiscordChannelLabel(value, fallbackId) {
   return fallback || 'unknown';
 }
 
-export function discordSessionTitle({ channelLabel, now = new Date() } = {}) {
-  return `discord:${sanitizeDiscordChannelLabel(channelLabel, 'unknown')}:${formatDiscordSessionTimestamp(now)}`;
+/**
+ * Build the explicit Discord Session title.
+ *
+ * The `"<label> · "` prefix is deliberate: `installSessionTitlePrefix` treats a
+ * title that already carries a known channel label as decorated and will not
+ * append a second one. Callers pass the label for the active interface
+ * language; the fallback keeps the title stable for non-Host callers.
+ */
+export function discordSessionTitle({
+  channelLabel,
+  prefix = 'Discord',
+  now = new Date(),
+} = {}) {
+  const label = String(prefix ?? '').replace(CHANNEL_CONTROL, '').trim() || 'Discord';
+  return `${label} · ${sanitizeDiscordChannelLabel(channelLabel, 'unknown')}:${formatDiscordSessionTimestamp(now)}`;
 }
 
 function lookupChannel(channels, channel, id) {

@@ -1,22 +1,20 @@
 import { createProductionController } from './production.mjs';
-import { installWhatsappRpc } from './rpc.mjs';
+import { createWhatsappRpcHandler, installWhatsappRpc, WHATSAPP_RPC_CHANNEL } from './rpc.mjs';
+import { installProductionChannel } from '../shared/startup.mjs';
 
 export const name = 'dsh-im-whatsapp-host';
-export const inject = ['connection', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installWhatsappRpc(ctx, config.controller, config.rpcOptions, config.rpcAuthority);
   }
-  const production = await createProductionController(ctx, config, config.internals ?? {});
-  const disposeRpc = installWhatsappRpc(
-    ctx,
-    production.controller,
-    config.rpcOptions,
-    config.rpcAuthority,
-  );
-  ctx.effect(() => async () => production.close(), 'dsh-im: close WhatsApp Web connections');
-  return disposeRpc;
+  return installProductionChannel(ctx, config, {
+    channel: 'whatsapp',
+    rpcChannel: WHATSAPP_RPC_CHANNEL,
+    createProduction: () => createProductionController(ctx, config, config.internals ?? {}),
+    createHandler: controller => createWhatsappRpcHandler(controller, config.rpcOptions),
+  });
 }
 
 export function createWhatsappHostPlugin(config) {

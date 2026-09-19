@@ -24,6 +24,9 @@ const required = [
   'bin/dsh-im.mjs',
   'cordis.patch.yml',
   'README.md',
+  'README.en.md',
+  'PROACTIVE_DELIVERY.md',
+  'PROACTIVE_DELIVERY.en.md',
   'THIRD_PARTY_NOTICES.md',
   'plugin-src/client/channels/dingtalk/index.js',
   'plugin-src/client/channels/slack/index.js',
@@ -49,6 +52,7 @@ const required = [
   'src/channels/slack/slack-runtime.mjs',
   'src/channels/wecom/wecom-runtime.mjs',
   'src/channels/telegram/telegram-runtime.mjs',
+  'src/channels/telegram/telegram-http.mjs',
   'src/channels/discord/discord-runtime.mjs',
   'src/channels/whatsapp/whatsapp-runtime.mjs',
   'src/channels/whatsapp/whatsapp-web-session.mjs',
@@ -137,14 +141,23 @@ if ((client.match(/\.slots\.inject\(\s*["']settings\.section["']/gu) ?? []).leng
 if (client.includes('settings.plugins.tab') || clientSources.includes('settings.plugins.tab')) {
   throw new Error('client source or bundle still contains the legacy Plugins-tab settings entry');
 }
-// Connections still have no channel-enable toggle. Only the shared context
-// editor owns checkable inputs: two scope switches and one mapped field input.
+// Connections still have no channel-enable toggle. Checkable inputs are owned
+// only by the shared context editor and the saved-target Session sync row.
+// The context editor contains one switch template and one mapped field-input
+// template; the delivery target adds one ordinary checkbox template.
 const contextEditorSource = await readFile(resolve(root, 'plugin-src/client/context-enhancement.js'), 'utf8');
-const otherClientSources = clientSources.replace(contextEditorSource, '');
+const deliverySettingsSource = await readFile(resolve(root, 'plugin-src/client/delivery-settings.js'), 'utf8');
+const emailSettingsSource = await readFile(resolve(root, 'plugin-src/client/channels/email/index.js'), 'utf8');
+const otherClientSources = clientSources
+  .replace(contextEditorSource, '')
+  .replace(deliverySettingsSource, '')
+  .replace(emailSettingsSource, '');
 if (/role:\s*["']switch|type:\s*["']checkbox/.test(otherClientSources)
-  || (client.match(/role:\s*["']switch["']/g) ?? []).length !== 2
+  || (deliverySettingsSource.match(/type:\s*["']checkbox["']/g) ?? []).length !== 1
+  || /role:\s*["']switch["']/u.test(deliverySettingsSource)
+  || (client.match(/role:\s*["']switch["']/g) ?? []).length !== 1
   || (client.match(/type:\s*["']checkbox["']/g) ?? []).length !== 3) {
-  throw new Error('checkable inputs must be limited to the context-enhancement editor');
+  throw new Error('checkable inputs must be limited to context enhancement and Session sync');
 }
 for (const marker of ['bot.context-enhancement.set', '<dsh_im_source>', '<dsh_im_source_guidance>']) {
   if (!host.includes(marker) || !client.includes(marker)) {
@@ -196,6 +209,7 @@ const directDependencies = {
   '@wecom/aibot-node-sdk': '1.0.7',
   qrcode: '1.5.4',
   sharp: '0.35.3',
+  undici: '7.29.0',
 };
 for (const [name, version] of Object.entries(directDependencies)) {
   if (manifest.dependencies?.[name] !== version) {
@@ -227,7 +241,12 @@ if (/(?:from\s*|import\s*\(|require\s*\()\s*["'](?:@larksuiteoapi\/node-sdk|@whi
 if (!/["']sharp["']/.test(host)) {
   throw new Error('host bundle must keep sharp as an external runtime import');
 }
-if ((executable.mode & 0o111) === 0) throw new Error('dsh-im CLI is not executable');
+if (!/(?:from\s*|import\s*\()\s*["']undici["']/.test(host)) {
+  throw new Error('host bundle must retain undici as an external runtime dependency');
+}
+if (process.platform !== 'win32' && (executable.mode & 0o111) === 0) {
+  throw new Error('dsh-im CLI is not executable');
+}
 if (/private-bot-token|must-be-rolled-back|DEEPSEEK_API_KEY=/.test(client + host)) {
   throw new Error('built artifacts contain a test or environment secret marker');
 }

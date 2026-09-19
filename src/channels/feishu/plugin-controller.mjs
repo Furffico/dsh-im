@@ -1,16 +1,19 @@
 import { RegistrationManager } from './registration-manager.mjs';
+import { SLASH_COMMAND_TENANT_SCOPES } from './slash-command-registry.mjs';
 
 export const FEISHU_SECRET_REF = 'DSH_FEISHU_APP_SECRET';
 
 export const REQUIRED_TENANT_SCOPES = Object.freeze([
   'im:message.p2p_msg:readonly',
   'im:message.group_at_msg:readonly',
+  'im:message.group_at_msg.include_bot:readonly',
   'im:message:readonly',
   'im:message:send_as_bot',
   'im:message.reactions:write_only',
   'im:message:recall',
   'im:resource',
   'cardkit:card:write',
+  ...SLASH_COMMAND_TENANT_SCOPES,
 ]);
 
 function safeConnectionStatus(runtime) {

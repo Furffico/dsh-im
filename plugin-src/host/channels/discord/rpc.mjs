@@ -80,6 +80,9 @@ function toPublicRpcResult(result) {
     || error.code === 'workspace-not-directory'
     || error.code === 'agent-preset-invalid'
     || error.code === 'agent-preset-unavailable'
+    || error.code === 'model-selection-invalid'
+    || error.code === 'model-selection-unavailable'
+    || error.code === 'model-reasoning-unavailable'
     || error.code === 'context-enhancement-invalid'
     || error.code === 'invalid-token'
     || error.code === 'discord-intents') {

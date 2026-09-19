@@ -4,6 +4,7 @@ import { connectionTestMessage } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
 import { publicMessageFailure } from '../shared/message-failure.mjs';
 import { deriveQqBotIdentity, maskQqAppId } from './config-store.mjs';
+import { publicQqStateError } from './state-error.mjs';
 
 const ACTIVE_ATTEMPT_STATES = new Set(['starting', 'pending', 'refreshing', 'connecting']);
 const TERMINAL_ATTEMPT_STATES = new Set(['connected', 'failed', 'cancelled']);
@@ -15,6 +16,10 @@ function cleanString(value) {
 
 function safeError(code, message) {
   return Object.freeze({ code, message });
+}
+
+function connectionError(error, message) {
+  return publicQqStateError(error) ?? safeError('connection-failed', message);
 }
 
 function publicAttempt(record) {
@@ -86,7 +91,7 @@ export class QqController {
           await this.#startRuntime(config, appSecret);
           this.#errors.delete(config.botId);
         } catch (error) {
-          this.#errors.set(config.botId, safeError('connection-failed', t('QQ 连接未就绪，插件会自动重试。')));
+          this.#errors.set(config.botId, connectionError(error, t('QQ 连接未就绪，插件会自动重试。')));
           this.#logger.warn?.(`[dsh-im:qq] bot ${config.botId} failed to initialize:`, error);
         } finally {
           this.#touch();
@@ -209,7 +214,7 @@ export class QqController {
         await this.#startRuntime(config, normalizedSecret);
         this.#errors.delete(identity.botId);
       } catch (error) {
-        this.#errors.set(identity.botId, safeError('connection-failed', t('QQ 机器人已绑定，消息连接暂未就绪。')));
+        this.#errors.set(identity.botId, connectionError(error, t('QQ 机器人已绑定，消息连接暂未就绪。')));
         this.#logger.warn?.(`[dsh-im:qq] bot ${identity.botId} credential connection failed:`, error);
       }
       this.#touch();
@@ -242,7 +247,7 @@ export class QqController {
         await this.#startRuntime(config, secret);
         this.#errors.delete(botId);
       } catch (error) {
-        this.#errors.set(botId, safeError('connection-failed', t('QQ 连接仍未就绪，请稍后重试。')));
+        this.#errors.set(botId, connectionError(error, t('QQ 连接仍未就绪，请稍后重试。')));
         throw error;
       } finally {
         this.#touch();
@@ -265,6 +270,20 @@ export class QqController {
         t('QQ 机器人（{appId}）', { appId: maskQqAppId(config.appId) }),
       ));
       return { sent: true };
+    });
+  }
+
+  async sendProactiveText(botId, target, text, options = {}) {
+    const config = this.#configStore.get(botId);
+    if (!config) throw new Error('Unknown QQ bot');
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      if (!runtime?.status?.ready || typeof runtime.sendProactiveText !== 'function') {
+        const error = new Error(t('QQ机器人尚未连接'));
+        error.code = 'bot-not-connected';
+        throw error;
+      }
+      return runtime.sendProactiveText(target, text, options);
     });
   }
 
@@ -312,7 +331,8 @@ export class QqController {
         health: {
           status: connected ? 'healthy' : state === 'error' ? 'error' : 'offline',
           summary: connected ? t('QQ WebSocket 长连接运行正常')
-            : state === 'error' ? t('QQ 连接未就绪，插件会自动重试') : t('QQ 连接当前离线'),
+            : this.#errors.get(config.botId)?.message
+              ?? (state === 'error' ? t('QQ 连接未就绪，插件会自动重试') : t('QQ 连接当前离线')),
           lastCheckedAt: runtimeStatus?.lastCheckedAt ?? null,
           lastConnectedAt: runtimeStatus?.lastConnectedAt ?? null,
         },
@@ -420,7 +440,7 @@ export class QqController {
           await this.#restoreCredential(identity.secretRef, previousSecret);
           throw error;
         }
-        this.#errors.set(identity.botId, safeError('connection-failed', t('QQ 机器人已绑定，消息连接暂未就绪。')));
+        this.#errors.set(identity.botId, connectionError(error, t('QQ 机器人已绑定，消息连接暂未就绪。')));
         this.#logger.warn?.(`[dsh-im:qq] bot ${identity.botId} activation connection failed:`, error);
       }
       this.#touch();

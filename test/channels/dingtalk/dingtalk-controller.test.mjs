@@ -57,9 +57,11 @@ function configFixture(initial = [], events = []) {
 function runtimeFactory({ events = [], pendingByClient = new Map(), failStart = false } = {}) {
   const runtimes = [];
   const connectionTests = [];
+  const proactiveSends = [];
   return {
     runtimes,
     connectionTests,
+    proactiveSends,
     createRuntime: async ({ botId, config, clientSecret }) => {
       events.push(['create', botId]);
       let ready = false;
@@ -95,6 +97,10 @@ function runtimeFactory({ events = [], pendingByClient = new Map(), failStart = 
         },
         async sendConnectionTest(text) {
           connectionTests.push({ botId, text });
+        },
+        async sendProactiveText(...args) {
+          proactiveSends.push({ botId, args });
+          return { sent: true };
         },
       };
       runtimes.push(runtime);
@@ -154,6 +160,14 @@ test('successful QR poll stores secret then config then starts runtime without p
   assert.equal(runtimes.connectionTests[0].botId, completed.botId);
   assert.match(runtimes.connectionTests[0].text, /DeepSeek Harness 连接测试成功/);
   assert.match(runtimes.connectionTests[0].text, /钉钉机器人（ding••••vate）/);
+  const target = { kind: 'user', route: { userId: 'staff-one' } };
+  assert.deepEqual(await controller.sendProactiveText(completed.botId, target, '主动投递'), {
+    sent: true,
+  });
+  assert.deepEqual(runtimes.proactiveSends, [{
+    botId: completed.botId,
+    args: [target, '主动投递', {}],
+  }]);
   await controller.close();
 });
 
@@ -262,6 +276,7 @@ test('sender approval uses opaque request and sender keys while raw staff IDs st
 test('runtime activation failure retains the authorized bot for reconnect without exposing detail', async () => {
   let startCount = 0;
   const events = [];
+  const logs = [];
   const credentials = credentialsFixture(events);
   const configs = configFixture([], events);
   const runtimes = runtimeFactory({ events, failStart: () => startCount++ === 0 });
@@ -270,7 +285,7 @@ test('runtime activation failure retains the authorized bot for reconnect withou
     credentials: credentials.provider,
     configStore: configs.store,
     createRuntime: runtimes.createRuntime,
-    logger: { error() {}, warn() {} },
+    logger: { error: (...args) => logs.push(args), warn() {} },
     clock: () => 1_000,
   });
   const begun = await controller.startProvisioning();
@@ -282,10 +297,15 @@ test('runtime activation failure retains the authorized bot for reconnect withou
   const status = controller.status();
   assert.deepEqual(status.totals, { configured: 1, connected: 0 });
   assert.equal(status.bots[0].state, 'error');
-  assert.equal(status.bots[0].error.code, 'connection-failed');
+  assert.equal(status.bots[0].error.code, 'stream-connect-failed');
+  assert.match(status.bots[0].error.referenceId, /^DT-CONN-[A-F0-9]{8}$/);
+  assert.match(status.bots[0].error.hint, /dsh web 日志/);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0][0], new RegExp(status.bots[0].error.referenceId));
+  assert.equal(logs[0][1].category, 'stream-connect-failed');
   assert.equal(events.some(([event]) => event === 'unset' || event === 'remove'), false);
   assert.doesNotMatch(
-    JSON.stringify({ completed, status }),
+    JSON.stringify({ completed, status, logs }),
     /private-secret|client-secret-private|device-code-private|secretRef/,
   );
 

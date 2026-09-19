@@ -46,7 +46,9 @@ function artifactError(code, message) {
 }
 
 function currentTurn(agent) {
-  const events = agent?.session?.events;
+  const events = typeof agent?.session?.snapshotEvents === 'function'
+    ? agent.session.snapshotEvents()
+    : agent?.session?.events;
   if (!Array.isArray(events)) return null;
   let turn = null;
   for (const event of events) {
@@ -394,7 +396,7 @@ export class OutboundArtifactRegistry {
     const agent = exec?.agent;
     const sessionId = agent?.session?.header?.id;
     const workspace = agent?.session?.header?.cwd;
-    const turn = currentTurn(agent);
+    const turn = this.#openTurns.get(sessionId) ?? currentTurn(agent);
     if (typeof sessionId !== 'string' || !sessionId
       || typeof workspace !== 'string' || !workspace || turn === null) {
       throw artifactError(
@@ -601,7 +603,7 @@ export function createOutboundArtifactTool({ registry = outboundArtifactRegistry
   };
   const definition = Object.freeze({
     name: OUTBOUND_ARTIFACT_TOOL,
-    description: 'Send a readable file or generated image to the user through the current conversation. Existing and newly created files are both valid. path may be one string or an array of strings.',
+    description: 'Register a readable file or generated image for delivery through the current conversation after this turn. Existing and newly created files are both valid. path may be one string or an array of strings. Success means queued, not sent; do not claim the user has received the file.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -659,12 +661,12 @@ export function createOutboundArtifactTool({ registry = outboundArtifactRegistry
           const names = value.artifacts.map((artifact) => artifact.fileName).join(', ');
           return [{
             type: 'text',
-            text: `Registered ${value.artifacts.length} files for IM delivery: ${names}.`,
+            text: `Registered ${value.artifacts.length} files for IM delivery after this turn: ${names}. The files have not been sent yet; describe them as prepared or queued, not sent or received.`,
           }];
         }
         return [{
           type: 'text',
-          text: `Registered ${value.fileName} (${value.size} bytes) for IM delivery.`,
+          text: `Registered ${value.fileName} (${value.size} bytes) for IM delivery after this turn. The file has not been sent yet; describe it as prepared or queued, not sent or received.`,
         }];
       },
     },
@@ -734,7 +736,7 @@ export function installOutboundArtifactTool(ctx, { registry = outboundArtifactRe
   ctx.systemPrompt.section({
     name: 'dsh-im:return-file',
     order: 115,
-    text: `When the user asks to receive a file or generated image, call ${OUTBOUND_ARTIFACT_TOOL} with its path. path may be one string or an array of strings; prefer one array call when sending multiple files together. Existing files can be sent directly; do not recreate or rename a file solely for delivery.`,
+    text: `When the user asks to receive a file or generated image, call ${OUTBOUND_ARTIFACT_TOOL} with its path. path may be one string or an array of strings; prefer one array call when sending multiple files together. Existing files can be sent directly; do not recreate or rename a file solely for delivery. This tool only registers the file; the channel uploads and sends it after your turn finishes. In your reply say the file is prepared or queued, never that it has already been sent or received. The channel reports delivery failures separately.`,
   });
   return true;
 }

@@ -1,9 +1,33 @@
 // Shared by the Host and settings UI; keep this module browser-compatible.
 export const CONTEXT_ENHANCEMENT_FIELDS = Object.freeze([
-  'channel', 'conversationType', 'senderId', 'senderName', 'botId',
+  'channel', 'conversationType', 'senderId', 'senderName', 'conversationTitle',
+  'chatId', 'threadId', 'botId',
 ]);
 
+/**
+ * Tag grammar of the injected context prefix. The producer here and the
+ * Host-side splitter in `injected-context.mjs` share these literals, so the
+ * prefix a channel writes can never drift from the parser that pairs it.
+ */
+export const INJECTED_CONTEXT_TAGS = Object.freeze({
+  sourceOpen: '<dsh_im_source>',
+  sourceClose: '</dsh_im_source>',
+  guidanceOpen: '<dsh_im_source_guidance>',
+  guidanceClose: '</dsh_im_source_guidance>',
+  replyOpen: '<dsh_im_reply_to>',
+  replyClose: '</dsh_im_reply_to>',
+});
+
+/** Separator the producer joins prefix blocks with, and the splitter consumes. */
+export const INJECTED_CONTEXT_SEPARATOR = '\n\n';
+
 export const CONTEXT_ENHANCEMENT_GUIDANCE_MAX_LENGTH = 8_000;
+export const CONTEXT_GROUP_GUIDANCE_EXAMPLE = `仅依据当前消息的 <dsh_im_source> 中实际提供的字段理解来源；没有提供的字段不要猜测或补全。
+当前消息来自群聊，请使用严肃、克制、简洁的表达方式。`;
+export const CONTEXT_DIRECT_GUIDANCE_EXAMPLE = `仅依据当前消息的 <dsh_im_source> 中实际提供的字段理解来源；没有提供的字段不要猜测或补全。
+当前消息来自私聊，可以使用更轻松、幽默、详细的表达方式。`;
+
+// Kept for integrations that imported the original combined example.
 export const CONTEXT_GUIDANCE_EXAMPLE = `仅依据当前消息的 <dsh_im_source> 中实际提供的字段理解来源；没有提供的字段不要猜测或补全。
 conversationType是群聊时回复严肃一点，conversationType是私聊时回复一定要幽默搞笑，像周星驰的电影一样搞笑`;
 
@@ -11,18 +35,29 @@ conversationType是群聊时回复严肃一点，conversationType是私聊时回
 export const DEFAULT_CONTEXT_GUIDANCE = CONTEXT_GUIDANCE_EXAMPLE;
 
 export const DEFAULT_CONTEXT_ENHANCEMENT_CONFIG = Object.freeze({
-  groupEnabled: false,
-  directEnabled: false,
-  fields: Object.freeze(['senderId']),
-  guidance: '',
+  group: Object.freeze({
+    enabled: false,
+    fields: Object.freeze(['senderId']),
+    guidance: '',
+  }),
+  direct: Object.freeze({
+    enabled: false,
+    fields: Object.freeze(['senderId']),
+    guidance: '',
+  }),
 });
 
-const CONFIG_KEYS = ['groupEnabled', 'directEnabled', 'fields', 'guidance'];
+const CONFIG_KEYS = ['group', 'direct'];
+const SCOPE_KEYS = ['enabled', 'fields', 'guidance'];
+const LEGACY_CONFIG_KEYS = ['groupEnabled', 'directEnabled', 'fields', 'guidance'];
 const CHANNELS = new Set([
   'wecom', 'weixin', 'feishu', 'dingtalk', 'qq',
   'slack', 'telegram', 'discord', 'whatsapp',
 ]);
-const SOURCE_LIMITS = { channel: 16, conversationType: 6, senderId: 256, senderName: 256, botId: 128 };
+const SOURCE_LIMITS = {
+  channel: 16, conversationType: 6, senderId: 256, senderName: 256,
+  conversationTitle: 256, chatId: 256, threadId: 256, botId: 128,
+};
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
 
 function invalidConfig(message) {
@@ -31,29 +66,60 @@ function invalidConfig(message) {
   return error;
 }
 
-/** Validate the complete atomic save, preserving explicit empty selections/text. */
-export function validateContextEnhancementConfig(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(input))
-    || Reflect.ownKeys(input).length !== CONFIG_KEYS.length
-    || !CONFIG_KEYS.every((key) => Object.hasOwn(input, key))) {
+function hasExactKeys(input, keys) {
+  return input && typeof input === 'object' && !Array.isArray(input)
+    && [Object.prototype, null].includes(Object.getPrototypeOf(input))
+    && Reflect.ownKeys(input).length === keys.length
+    && keys.every((key) => Object.hasOwn(input, key));
+}
+
+function validateContextEnhancementScope(input) {
+  if (!hasExactKeys(input, SCOPE_KEYS)) {
     throw invalidConfig('请提交完整的上下文增强设置。');
   }
-  const { groupEnabled, directEnabled, fields, guidance } = input;
-  if (typeof groupEnabled !== 'boolean' || typeof directEnabled !== 'boolean') {
+  const { enabled, fields, guidance } = input;
+  if (typeof enabled !== 'boolean') {
     throw invalidConfig('群聊和私聊开关必须是布尔值。');
   }
   if (!Array.isArray(fields) || ![...fields].every((field) => CONTEXT_ENHANCEMENT_FIELDS.includes(field))) {
-    throw invalidConfig('来源字段只能选择已定义的五个字段。');
+    throw invalidConfig('来源字段只能选择已定义的八个字段。');
   }
   if (typeof guidance !== 'string' || guidance.length > CONTEXT_ENHANCEMENT_GUIDANCE_MAX_LENGTH) {
     throw invalidConfig(`增强提示词不得超过 ${CONTEXT_ENHANCEMENT_GUIDANCE_MAX_LENGTH} 个字符。`);
   }
   return Object.freeze({
-    groupEnabled,
-    directEnabled,
+    enabled,
     fields: Object.freeze(CONTEXT_ENHANCEMENT_FIELDS.filter((field) => fields.includes(field))),
     guidance: guidance.trim() ? guidance : '',
+  });
+}
+
+/** Validate the complete atomic save, preserving explicit empty selections/text. */
+export function validateContextEnhancementConfig(input) {
+  if (!hasExactKeys(input, CONFIG_KEYS)) {
+    throw invalidConfig('请提交完整的上下文增强设置。');
+  }
+  return Object.freeze({
+    group: validateContextEnhancementScope(input.group),
+    direct: validateContextEnhancementScope(input.direct),
+  });
+}
+
+function migrateLegacyContextEnhancementConfig(input) {
+  if (!hasExactKeys(input, LEGACY_CONFIG_KEYS)) {
+    throw invalidConfig('请提交完整的上下文增强设置。');
+  }
+  return validateContextEnhancementConfig({
+    group: {
+      enabled: input.groupEnabled,
+      fields: input.fields,
+      guidance: input.guidance,
+    },
+    direct: {
+      enabled: input.directEnabled,
+      fields: input.fields,
+      guidance: input.guidance,
+    },
   });
 }
 
@@ -62,7 +128,11 @@ export function normalizeContextEnhancementConfig(input) {
   try {
     return validateContextEnhancementConfig(input);
   } catch {
-    return DEFAULT_CONTEXT_ENHANCEMENT_CONFIG;
+    try {
+      return migrateLegacyContextEnhancementConfig(input);
+    } catch {
+      return DEFAULT_CONTEXT_ENHANCEMENT_CONFIG;
+    }
   }
 }
 
@@ -71,14 +141,38 @@ export function captureContextEnhancement(provider, conversationType) {
   if (conversationType !== 'group' && conversationType !== 'direct') return null;
   try {
     const settings = provider?.getSettings?.();
-    const enabledKey = conversationType === 'group' ? 'groupEnabled' : 'directEnabled';
-    if (settings?.[enabledKey] !== true) return null;
+    const legacyEnabledKey = conversationType === 'group' ? 'groupEnabled' : 'directEnabled';
+    const enabled = Object.hasOwn(settings ?? {}, conversationType)
+      ? settings?.[conversationType]?.enabled
+      : settings?.[legacyEnabledKey];
+    if (enabled !== true) return null;
     const config = normalizeContextEnhancementConfig(settings);
-    if (config[enabledKey] !== true) return null;
-    return Object.freeze({ config, botId: provider.botId, conversationType });
+    const scope = config[conversationType];
+    if (scope.enabled !== true) return null;
+    return Object.freeze({ config: scope, botId: provider.botId, conversationType });
   } catch {
     return null;
   }
+}
+
+/**
+ * Capture the enhancement one prompt replays, together with the source factory
+ * that fills its selected fields.
+ *
+ * Ordinary messages snapshot this when they are accepted, so a queued message
+ * keeps the settings it arrived under. A control command is never queued, so it
+ * captures at the moment it runs -- and it must, because the source fields of a
+ * steering instruction belong to whoever issued it, not to the message that
+ * opened the turn.
+ *
+ * @param provider - the bot's enhancement provider.
+ * @param conversationType - the inbound message's scope.
+ * @param source - factory for the currently selected source fields.
+ * @returns the enhancement to apply, or null when the scope is off.
+ */
+export function captureContextEnhancementSource(provider, conversationType, source) {
+  const snapshot = captureContextEnhancement(provider, conversationType);
+  return snapshot === null ? null : Object.freeze({ snapshot, source });
 }
 
 function sourceString(value, field) {
@@ -93,7 +187,9 @@ function sourceString(value, field) {
 
 function sourceBlock(snapshot, sourceFactory) {
   const { fields } = snapshot.config;
-  const needsSource = fields.some((field) => ['channel', 'senderId', 'senderName'].includes(field));
+  const needsSource = fields.some((field) => [
+    'channel', 'senderId', 'senderName', 'conversationTitle', 'chatId', 'threadId',
+  ].includes(field));
   const source = needsSource ? sourceFactory?.() : null;
   const projected = {};
   for (const field of fields) {
@@ -106,7 +202,7 @@ function sourceBlock(snapshot, sourceFactory) {
   const json = JSON.stringify(projected).replace(/[<>&]/g, (character) => ({
     '<': '\\u003c', '>': '\\u003e', '&': '\\u0026',
   })[character]);
-  return `<dsh_im_source>${json}</dsh_im_source>`;
+  return `${INJECTED_CONTEXT_TAGS.sourceOpen}${json}${INJECTED_CONTEXT_TAGS.sourceClose}`;
 }
 
 function guidanceBlock(guidance) {
@@ -114,7 +210,7 @@ function guidanceBlock(guidance) {
   const body = guidance.replace(/<\/?dsh_im_source_guidance\b[^>]*(?:>|$)/gi, (tag) => (
     tag.replace(/</g, '&lt;').replace(/>/g, '&gt;')
   ));
-  return `<dsh_im_source_guidance>\n${body}\n</dsh_im_source_guidance>`;
+  return `${INJECTED_CONTEXT_TAGS.guidanceOpen}\n${body}\n${INJECTED_CONTEXT_TAGS.guidanceClose}`;
 }
 
 /** Add one text prefix; never inspect sources, format or copy content when off. */
@@ -124,7 +220,7 @@ export function enhanceContextContent(content, snapshot, sourceFactory) {
     const blocks = [sourceBlock(snapshot, sourceFactory), guidanceBlock(snapshot.config.guidance)]
       .filter(Boolean);
     if (blocks.length === 0) return content;
-    const prefix = blocks.join('\n\n');
+    const prefix = blocks.join(INJECTED_CONTEXT_SEPARATOR);
     if (typeof content === 'string') return `${prefix}\n\n${content}`;
     if (Array.isArray(content)) return [{ type: 'text', text: prefix }, ...content];
     return content;

@@ -6,6 +6,8 @@ import {
 import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
+import { dingtalkRuntimeStartError } from './connection-error.mjs';
+import { DINGTALK_CARD_TOPIC } from './dingtalk-menu.mjs';
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -130,6 +132,7 @@ export class DingtalkRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #maxMessageChars;
@@ -152,6 +155,7 @@ export class DingtalkRuntime {
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
@@ -170,6 +174,7 @@ export class DingtalkRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
@@ -220,10 +225,12 @@ export class DingtalkRuntime {
     this.#status.startedAt = new Date().toISOString();
     this.#status.dingtalkStreamState = 'connecting';
     this.#status.lastError = null;
+    let startStage = 'dingtalk-harness-connect-failed';
 
     try {
       await this.#harness.ensureRunning({ signal });
       this.#status.harnessReachable = true;
+      startStage = 'dingtalk-runtime-prepare-failed';
       if (typeof this.#state.removePendingSenderByStaffId === 'function') {
         for (const staffId of approvedSenderIds(this.#config)) {
           await this.#state.removePendingSenderByStaffId(staffId);
@@ -238,6 +245,7 @@ export class DingtalkRuntime {
         harness: this.#harness,
         state: this.#state,
         contextEnhancement: this.#contextEnhancement,
+        accessPolicy: this.#accessPolicy,
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
@@ -245,6 +253,7 @@ export class DingtalkRuntime {
         signal,
       });
 
+      startStage = 'dingtalk-stream-client-load-failed';
       const created = await this.#streamFactory({
         clientId: this.#config.clientId,
         clientSecret: this.#clientSecret,
@@ -262,6 +271,23 @@ export class DingtalkRuntime {
 
       const client = this.#client;
       const bridge = this.#bridge;
+      startStage = 'dingtalk-stream-listener-failed';
+      client.registerCallbackListener(DINGTALK_CARD_TOPIC, (response) => {
+        if (this.#client !== client || this.#bridge !== bridge) return;
+        const messageId = nonEmptyString(response?.headers?.messageId);
+        if (messageId) {
+          try { client.socketCallBackResponse(messageId, { success: true }); }
+          catch { this.#logger.warn?.('[dsh-dingtalk] unable to acknowledge a card callback'); }
+        }
+        const task = Promise.resolve().then(async () => {
+          if (this.#bridge !== bridge) return;
+          const callback = typeof response?.data === 'string' ? JSON.parse(response.data) : response?.data;
+          await bridge.acceptCard(callback, messageId);
+        }).catch(() => {
+          if (!signal.aborted) this.#logger.warn?.('[dsh-dingtalk] card callback processing failed');
+        }).finally(() => this.#callbackTasks.delete(task));
+        this.#callbackTasks.add(task);
+      });
       client.registerCallbackListener(this.#topic, (response) => {
         if (this.#client !== client || this.#bridge !== bridge) return;
         const callbackMessageId = nonEmptyString(response?.headers?.messageId);
@@ -310,6 +336,7 @@ export class DingtalkRuntime {
         this.#callbackTasks.add(task);
       });
 
+      startStage = 'dingtalk-stream-connect-failed';
       await connectStream(
         client,
         this.#connectTimeoutMs,
@@ -332,11 +359,12 @@ export class DingtalkRuntime {
       return this.status;
     } catch (error) {
       const aborted = signal.aborted;
+      const failure = aborted ? error : dingtalkRuntimeStartError(startStage, error);
       this.#status.ready = false;
       this.#status.dingtalkStreamState = aborted ? 'idle' : 'failed';
-      this.#status.lastError = aborted ? null : (error?.message ?? String(error));
+      this.#status.lastError = aborted ? null : (failure?.message ?? String(failure));
       await this.stop({ preserveError: !aborted });
-      throw error;
+      throw failure;
     }
   }
 
@@ -386,6 +414,45 @@ export class DingtalkRuntime {
         });
       },
     });
+  }
+
+  async sendProactiveText(target, text, { signal } = {}) {
+    const userId = typeof target?.route?.userId === 'string'
+      ? target.route.userId.trim() : '';
+    const openConversationId = typeof target?.route?.openConversationId === 'string'
+      ? target.route.openConversationId.trim() : '';
+    if ((target?.kind === 'user' && (!userId || openConversationId))
+      || (target?.kind === 'group' && (!openConversationId || userId))
+      || (target?.kind !== 'user' && target?.kind !== 'group')) {
+      const error = new TypeError('Invalid DingTalk proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    if (!this.#status.ready || !this.#abortController) {
+      const error = new Error('DingTalk runtime is not connected');
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    signal?.throwIfAborted();
+    try {
+      await this.#api.sendRobotText({
+        clientId: this.#config.clientId,
+        clientSecret: this.#clientSecret,
+        target: {
+          type: target.kind,
+          robotCode: this.#config.clientId,
+          ...(target.kind === 'user' ? { userId } : { openConversationId }),
+        },
+        text,
+        signal: signal ?? this.#abortController.signal,
+      });
+    } catch (cause) {
+      if (cause?.code !== 'send-rejected') throw cause;
+      const error = new Error('DingTalk rejected the proactive delivery target', { cause });
+      error.code = 'target-rejected';
+      throw error;
+    }
+    return { sent: true };
   }
 
   #pendingSenders() {

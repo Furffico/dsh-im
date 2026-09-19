@@ -9,6 +9,7 @@ import sharedC from './i18n-en/shared-c.mjs';
 import feishu from './i18n-en/feishu.mjs';
 import dingtalk from './i18n-en/dingtalk.mjs';
 import wecom from './i18n-en/wecom.mjs';
+import wecomApp from './i18n-en/wecom-app.mjs';
 import qq from './i18n-en/qq.mjs';
 import weixin from './i18n-en/weixin.mjs';
 import slack from './i18n-en/slack.mjs';
@@ -16,6 +17,7 @@ import telegram from './i18n-en/telegram.mjs';
 import discord from './i18n-en/discord.mjs';
 import whatsapp from './i18n-en/whatsapp.mjs';
 import office from './i18n-en/office.mjs';
+import email from './i18n-en/email.mjs';
 
 export const EN = Object.freeze(Object.assign(
   {},
@@ -25,6 +27,7 @@ export const EN = Object.freeze(Object.assign(
   feishu,
   dingtalk,
   wecom,
+  wecomApp,
   qq,
   weixin,
   slack,
@@ -32,4 +35,5 @@ export const EN = Object.freeze(Object.assign(
   discord,
   whatsapp,
   office,
+  email,
 ));

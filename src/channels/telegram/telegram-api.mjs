@@ -55,6 +55,42 @@ function inputRichMessage(value) {
   return value;
 }
 
+/** Telegram rejects callback_data longer than 64 bytes. */
+const CALLBACK_DATA_MAX_BYTES = 64;
+
+/** Validate an inline keyboard so no oversized or malformed payload is dispatched.
+ * An empty `inline_keyboard` is accepted: that is how Telegram removes a keyboard.
+ */
+function inputReplyMarkup(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('A Telegram reply markup is required');
+  }
+  const rows = value.inline_keyboard;
+  if (!Array.isArray(rows)) {
+    throw new TypeError('Telegram reply markup requires inline_keyboard rows');
+  }
+  return {
+    inline_keyboard: rows.map((row) => {
+      if (!Array.isArray(row) || row.length === 0) {
+        throw new TypeError('Telegram inline keyboard rows must be non-empty arrays');
+      }
+      return row.map((button) => {
+        const text = cleanString(button?.text);
+        const data = cleanString(button?.callback_data);
+        if (!text || !data) {
+          throw new TypeError('Telegram inline keyboard buttons require text and callback_data');
+        }
+        if (Buffer.byteLength(data, 'utf8') > CALLBACK_DATA_MAX_BYTES) {
+          throw new TypeError(
+            `Telegram callback_data must be at most ${CALLBACK_DATA_MAX_BYTES} bytes`,
+          );
+        }
+        return { text, callback_data: data };
+      });
+    }),
+  };
+}
+
 function telegramArtifactProviderError(cause, mediaLabel = 'document') {
   const providerCode = Number(cause?.providerCode);
   const status = Number(cause?.status);
@@ -96,8 +132,16 @@ function validBotCommand(value) {
   return Boolean(value)
     && typeof value === 'object' && !Array.isArray(value)
     && typeof value.command === 'string' && TELEGRAM_COMMAND_NAME.test(value.command)
-    && typeof value.description === 'string' && value.description.length >= 1
-    && value.description.length <= 256;
+    && typeof value.description === 'string' && value.description.trim().length >= 1
+    && [...value.description].length <= 256;
+}
+
+export function validateTelegramCommands(commands, { allowEmpty = false } = {}) {
+  if (!Array.isArray(commands) || (!allowEmpty && commands.length === 0)
+    || commands.length > 100 || commands.some((command) => !validBotCommand(command))
+    || new Set(commands.map((item) => item.command)).size !== commands.length) {
+    throw new TypeError('Telegram bot commands are invalid');
+  }
 }
 
 export const COMMANDS_MENU_BUTTON = Object.freeze({ type: 'commands' });
@@ -105,19 +149,23 @@ export const COMMANDS_MENU_BUTTON = Object.freeze({ type: 'commands' });
 export class TelegramApi {
   #token;
   #fetch;
+  #FormDataImpl;
   #baseUrl;
   #fileUploadTimeoutMs;
 
   constructor({
     token,
     fetchImpl = fetch,
+    FormDataImpl = globalThis.FormData,
     baseUrl = DEFAULT_BASE_URL,
     fileUploadTimeoutMs = DEFAULT_FILE_UPLOAD_TIMEOUT_MS,
   }) {
     if (!validTelegramToken(token)) throw new TypeError('Telegram Bot Token is invalid');
     if (typeof fetchImpl !== 'function') throw new TypeError('TelegramApi requires fetch');
+    if (typeof FormDataImpl !== 'function') throw new TypeError('TelegramApi requires FormData');
     this.#token = token.trim();
     this.#fetch = fetchImpl;
+    this.#FormDataImpl = FormDataImpl;
     this.#baseUrl = new URL(baseUrl);
     this.#fileUploadTimeoutMs = positiveTimeout(fileUploadTimeoutMs, 'fileUploadTimeoutMs');
   }
@@ -134,7 +182,7 @@ export class TelegramApi {
     const payload = {
       timeout,
       limit: 100,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'callback_query'],
       ...(Number.isSafeInteger(offset) ? { offset } : {}),
     };
     return this.#call('getUpdates', payload, {
@@ -191,7 +239,7 @@ export class TelegramApi {
     return url;
   }
 
-  async sendMessage({ chatId, text, replyToMessageId, messageThreadId, signal }) {
+  async sendMessage({ chatId, text, replyToMessageId, messageThreadId, replyMarkup, signal }) {
     return this.#call('sendMessage', {
       chat_id: chatId,
       text,
@@ -200,6 +248,30 @@ export class TelegramApi {
         reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true },
       } : {}),
       ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      ...(replyMarkup === undefined ? {} : { reply_markup: inputReplyMarkup(replyMarkup) }),
+    }, { signal });
+  }
+
+  /** Acknowledge a button press so the client stops showing its progress spinner. */
+  async answerCallbackQuery({ callbackQueryId, text, signal }) {
+    const queryId = cleanString(callbackQueryId);
+    if (!queryId) throw new TypeError('Telegram callback query id is required');
+    const notice = cleanString(text);
+    return this.#call('answerCallbackQuery', {
+      callback_query_id: queryId,
+      ...(notice ? { text: notice } : {}),
+    }, { signal });
+  }
+
+  /** Replace only the keyboard of an existing message, keeping its text intact. */
+  async editMessageReplyMarkup({ chatId, messageId, replyMarkup, signal }) {
+    if (!Number.isSafeInteger(messageId)) {
+      throw new TypeError('Telegram message id must be a safe integer');
+    }
+    return this.#call('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      ...(replyMarkup === undefined ? {} : { reply_markup: inputReplyMarkup(replyMarkup) }),
     }, { signal });
   }
 
@@ -273,7 +345,7 @@ export class TelegramApi {
       || !Buffer.isBuffer(file.bytes)) {
       throw new TypeError(`A Telegram ${mediaLabel} is required`);
     }
-    const payload = new FormData();
+    const payload = new this.#FormDataImpl();
     payload.append('chat_id', String(chatId));
     payload.append(
       fieldName,
@@ -330,12 +402,16 @@ export class TelegramApi {
   }
 
   async setMyCommands({ commands, scope, languageCode, signal } = {}) {
-    if (!Array.isArray(commands) || commands.length === 0
-      || commands.some((command) => !validBotCommand(command))) {
-      throw new TypeError('Telegram bot commands are invalid');
-    }
+    validateTelegramCommands(commands);
     return this.#call('setMyCommands', {
       commands,
+      ...(scope ? { scope } : {}),
+      ...(cleanString(languageCode) ? { language_code: cleanString(languageCode) } : {}),
+    }, { signal });
+  }
+
+  async deleteMyCommands({ scope, languageCode, signal } = {}) {
+    return this.#call('deleteMyCommands', {
       ...(scope ? { scope } : {}),
       ...(cleanString(languageCode) ? { language_code: cleanString(languageCode) } : {}),
     }, { signal });

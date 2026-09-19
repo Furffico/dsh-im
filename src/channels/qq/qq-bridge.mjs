@@ -1,3 +1,4 @@
+import { createDeferredDeliveryCoordinator, deferredOutcomeText } from '../shared/deferred-delivery-coordinator.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
@@ -21,7 +22,11 @@ import {
   runPresetCommand,
 } from '../shared/preset-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
-import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
+import {
+  captureContextEnhancement,
+  captureContextEnhancementSource,
+  enhanceContextContent,
+} from '../shared/context-enhancement.mjs';
 import {
   BatchInputManager,
   batchInputBusyMessage,
@@ -33,7 +38,6 @@ import {
   hasInboundImages,
   imagePromptDiagnostic,
   imagePromptUserMessage,
-  promptContentForMessage,
 } from '../shared/image-prompt.mjs';
 import {
   hasInboundFiles,
@@ -45,6 +49,10 @@ import {
 } from '../shared/semantic/artifact.mjs';
 import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
 import {
+  hasReplyReference,
+  promptContentForInboundMessage,
+} from '../shared/semantic/reply-reference.mjs';
+import {
   createDeliveryReceipt,
   providerMessageIdsFor,
 } from '../shared/semantic/delivery.mjs';
@@ -54,7 +62,16 @@ import {
   messageFailureText,
   setLastMessageFailure,
 } from '../shared/message-failure.mjs';
+import {
+  COMMAND_PERMISSION_DENIED_MESSAGE,
+  evaluateInboundAccess,
+} from '../shared/inbound-access.mjs';
 import { sendMarkdownReply } from './markdown-reply.mjs';
+import {
+  isQqMenuCommand, parseQqMenuCommand, QqMenuStore,
+  qqMenuPage, qqMenuView, sendQqMenu,
+} from './qq-menu.mjs';
+import { withSessionBindingLock } from '../shared/session-binding-lock.mjs';
 import { t } from '../shared/i18n.mjs';
 
 function interactionResolvedText() {
@@ -78,19 +95,22 @@ function helpText() {
     t('QQ 机器人已连接 DeepSeek Harness。'),
     '',
     t('直接发送文字、图片或文件即可继续当前会话。'),
+    t('/menu 或 /m  打开可点击的功能菜单'),
     t('/new  开启一个全新会话'),
     t('/compact  压缩当前会话的较早上下文'),
     t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
-    t('/workspace 工作区绝对路径  切换工作区'),
+    t('/workspace 工作区序号或绝对路径  切换工作区'),
     t('/workspacelist  列出工作区绝对路径'),
-    t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/ws、/wsl、/workspaces  工作区命令别名'),
+    t('/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/sessionlist --limit N  仅列出当前工作区前 N 个会话'),
     t('/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话'),
     t('/models  按序号列出所有可用模型'),
     t('/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级'),
     t('/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级'),
     t('/model [序号或完整模型ID] [推理等级ID]  查看或切换当前会话模型'),
     t('示例：先发 /models，再发 /model 2 [推理等级ID]'),
-    t('/presetlist  按序号列出可用 Agent Preset'),
+    t('/presetlist 或 /presets  按序号列出可用 Agent Preset'),
     t('/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset'),
     t('纯数字 ID：/preset id:<ID>'),
     t('/preset --default  跟随 Host 默认'),
@@ -107,6 +127,12 @@ function helpText() {
 
 function conversationKey(message) {
   return `${message.kind}:${message.kind === 'group' ? message.groupOpenid : message.senderId}`;
+}
+
+function senderAllowed(message, ownerUserOpenid) {
+  return message?.kind === 'group'
+    || ownerUserOpenid === '*'
+    || message?.senderId === ownerUserOpenid;
 }
 
 function safeText(message) {
@@ -133,6 +159,37 @@ function hasQqImageAttachments(message) {
 function hasQqFileAttachments(message) {
   return Array.isArray(message?.attachments)
     && message.attachments.some((attachment) => !isQqImageAttachment(attachment));
+}
+
+function qqAttachmentKind(attachment) {
+  const mediaType = attachmentMediaType(attachment);
+  if (mediaType?.startsWith('image/')) return 'image';
+  if (mediaType?.startsWith('audio/')) return 'audio';
+  if (mediaType?.startsWith('video/')) return 'video';
+  return 'file';
+}
+
+function qqReplyReference(message) {
+  const refMsgIdx = nonEmptyString(message?.refMsgIdx);
+  if (!refMsgIdx) return null;
+  const element = Array.isArray(message?.msgElements) ? message.msgElements[0] : null;
+  const sourceAttachments = Array.isArray(element?.attachments) ? element.attachments : [];
+  const attachments = sourceAttachments.map((attachment) => {
+    const name = nonEmptyString(attachment?.filename);
+    return { kind: qqAttachmentKind(attachment), ...(name ? { name } : {}) };
+  });
+  const asrText = sourceAttachments
+    .filter((attachment) => qqAttachmentKind(attachment) === 'audio')
+    .map((attachment) => nonEmptyString(attachment?.asr_refer_text))
+    .filter(Boolean)
+    .join('\n');
+  const content = asrText || nonEmptyString(element?.content);
+  return {
+    messageId: refMsgIdx,
+    ...(content ? { content } : {}),
+    ...(attachments.length > 0 ? { attachments } : {}),
+    ...(!content && attachments.length === 0 ? { unavailableReason: 'not-delivered' } : {}),
+  };
 }
 
 async function fetchQqFileBuffer(url, { fetchImpl, signal }) {
@@ -186,7 +243,13 @@ export function qqInboundMessage(message, { fetchImpl = fetch } = {}) {
       },
     });
   }
-  return { content: safeText(message), images, files };
+  const replyTo = qqReplyReference(message);
+  return {
+    content: safeText(message),
+    images,
+    files,
+    ...(replyTo ? { replyTo } : {}),
+  };
 }
 
 function nonEmptyString(value) {
@@ -366,7 +429,9 @@ export class QqHarnessBridge {
   #ownerUserOpenid;
   #harness;
   #state;
+  #deferred;
   #contextEnhancement;
+  #accessPolicy;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -382,6 +447,8 @@ export class QqHarnessBridge {
   #commandTasks = new Set();
   #approvals;
   #batchInputs = new BatchInputManager();
+  #menus = new QqMenuStore();
+  #menuTasks = new Map();
 
   constructor({
     bot,
@@ -389,6 +456,7 @@ export class QqHarnessBridge {
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     status = createQqBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -408,10 +476,14 @@ export class QqHarnessBridge {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#signal = signal;
+    this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
+      deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
+    });
     this.#fetchImpl = fetchImpl;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
     this.#approvals = new HarnessApprovalQueue({ label: 'qq', logger });
@@ -430,6 +502,36 @@ export class QqHarnessBridge {
       || this.#state.hasSeen(messageId)
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     const key = conversationKey(message);
+    const addressed = message.kind !== 'group'
+      || message.rawEventType === 'GROUP_AT_MESSAGE_CREATE';
+    const commandText = safeText(message);
+    const menuTextOnly = !hasQqImageAttachments(message) && !hasQqFileAttachments(message)
+      && !qqReplyReference(message);
+    const explicitMenu = menuTextOnly && isQqMenuCommand(commandText);
+    const numericMenu = menuTextOnly && /^\d{1,2}$/u.test(commandText)
+      && this.#menus.has(key, sender)
+      && !this.#pendingInteractions.has(key) && !this.#approvals.hasPending(key)
+      && this.#batchInputs.status(key).phase === 'idle';
+    const menuInput = numericMenu
+      ? `/m pick ${this.#menus.tokenFor(key, sender)} ${commandText}` : commandText;
+    if (addressed) {
+      const access = this.#accessPolicy
+        ? evaluateInboundAccess(this.#accessPolicy, {
+            conversationType: message.kind === 'c2c' ? 'direct' : 'group',
+            senderIds: sender,
+            text: commandText,
+            hasImages: hasQqImageAttachments(message),
+            hasFiles: hasQqFileAttachments(message),
+            ...(explicitMenu || numericMenu ? { isCommand: true } : {}),
+          })
+        : senderAllowed(message, this.#ownerUserOpenid)
+          ? { allowed: true, reason: 'legacy-owner' }
+          : { allowed: false, reason: 'sender-not-allowed' };
+      if (!access.allowed) {
+        this.#acceptedMessageIds.set(messageId, null);
+        return this.#finishAccessDecision(message, messageId, access);
+      }
+    }
     this.#acceptedMessageIds.set(messageId, captureContextEnhancement(
       this.#contextEnhancement,
       message.kind === 'c2c' ? 'direct' : 'group',
@@ -441,21 +543,23 @@ export class QqHarnessBridge {
       rememberConnectionTestTarget(this.#state, message.replyTarget);
     }
     const pending = this.#pendingInteractions.get(key);
-    const commandText = safeText(message);
-    const allowed = this.#ownerUserOpenid === '*' || sender === this.#ownerUserOpenid;
-    const addressed = message.kind !== 'group'
-      || message.rawEventType === 'GROUP_AT_MESSAGE_CREATE';
     const batchCommand = isBatchInputCommand(commandText);
     const batchStatus = this.#batchInputs.status(key);
-    if (batchCommand && allowed && addressed && message.kind === 'group') {
+    // Ordinary prompts and other commands end number selection. A pending
+    // question/approval or batch keeps its existing interpretation of digits.
+    if (addressed && !explicitMenu && !numericMenu) this.#menus.clear(key, sender);
+    if (batchCommand && addressed && message.kind === 'group') {
       return this.#finishBatchResult(
         message,
         messageId,
         { message: batchInputGroupUnsupportedMessage() },
       );
     }
-    if (allowed && message.kind === 'c2c'
+    if (message.kind === 'c2c'
       && (batchCommand || batchStatus.phase === 'collecting')) {
+      if (explicitMenu) return this.#finishBatchResult(message, messageId, {
+        message: t('当前正在批量输入，请先发送 /send 或 /cancel，再打开菜单。'),
+      });
       const exactBatchStart = /^\/batch$/iu.test(commandText);
       const result = exactBatchStart
         && batchStatus.phase === 'idle'
@@ -464,12 +568,20 @@ export class QqHarnessBridge {
         : this.#batchInputs.handle(key, commandText, {
             plainText: Boolean(commandText)
               && !hasQqImageAttachments(message)
-              && !hasQqFileAttachments(message),
+              && !hasQqFileAttachments(message)
+              && !qqReplyReference(message),
           });
       if (result.handled) {
         if (result.kind === 'submit') {
           return this.#enqueueMessage(
-            { ...message, content: result.prompt, attachments: [] },
+            {
+              ...message,
+              content: result.prompt,
+              // The submission is exactly the collected text: the command
+              // message's own attachments and quoted message are not part of it.
+              attachments: [],
+              refMsgIdx: undefined,
+            },
             messageId,
             key,
             { batchSubmission: result },
@@ -478,13 +590,15 @@ export class QqHarnessBridge {
         return this.#finishBatchResult(message, messageId, result);
       }
     }
-    const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+    const commandRunner = explicitMenu || numericMenu
+      ? () => this.#runMenuCommand(message, menuInput, key)
+      : isHistoryCommand(commandText) ? runHistoryCommand
       : hasQqFileAttachments(message) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
           ? runModelCommand
           : (isPresetCommand(commandText) ? runPresetCommand : null));
-    if (commandRunner && allowed && addressed) {
+    if (commandRunner && addressed) {
       let task;
       task = this.#processFastCommand(
         message,
@@ -569,10 +683,9 @@ export class QqHarnessBridge {
     alreadyRecorded = false,
     batchSubmission = null,
   } = {}) {
-    const allowed = this.#ownerUserOpenid === '*' || message.senderId === this.#ownerUserOpenid;
     const addressed = message.kind !== 'group'
       || message.rawEventType === 'GROUP_AT_MESSAGE_CREATE';
-    const preparedMessage = allowed && addressed
+    const preparedMessage = addressed
       ? prefetchInboundFiles(
           qqInboundMessage(message, { fetchImpl: this.#fetchImpl }),
           { signal: this.#signal },
@@ -594,6 +707,110 @@ export class QqHarnessBridge {
     return current;
   }
 
+  async #deliverDeferredOutcome(entry, outcome) {
+    await sendMarkdownReply(this.#bot, entry.target, deferredOutcomeText(outcome), { logger: this.#logger });
+    return true;
+  }
+
+  #menuContext(key) {
+    const workspace = this.#harness.currentWorkspace?.();
+    const sessionWorkspace = typeof this.#harness.currentConversationWorkspace === 'function'
+      ? this.#harness.currentConversationWorkspace(key) : workspace;
+    return { workspace, sessionWorkspace, sessionId: this.#state.sessionFor(key) };
+  }
+
+  async #showMenu(message, key, name, pageView = null) {
+    const actor = message.senderId;
+    const context = this.#menuContext(key);
+    const entry = this.#menus.begin(key, actor, context);
+    const view = pageView ?? await qqMenuView(name, this.#harness, this.#state, key, {
+      signal: this.#signal, busy: this.#queues.has(key)
+        || this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
+    });
+    this.#signal?.throwIfAborted();
+    this.#harness.assertWorkspaceScope?.();
+    const current = this.#menuContext(key);
+    if (current.workspace !== context.workspace || current.sessionWorkspace !== context.sessionWorkspace
+      || current.sessionId !== context.sessionId) {
+      return { message: t('会话或工作区已变化，请重新发送 /m。') };
+    }
+    if (!this.#menus.publish(key, actor, entry, view)) return { messages: [] };
+    await sendQqMenu(this.#bot, message.replyTarget, view, entry.token, { logger: this.#logger });
+    this.#status.messagesReplied += 1;
+    this.#status.lastReplyAt = new Date().toISOString();
+    return { messages: [] };
+  }
+
+  async #runMenuCommand(message, text, key) {
+    const parsed = isQqMenuCommand(text) ? parseQqMenuCommand(text) : { number: Number(text) };
+    if (parsed.error) return { message: t('菜单命令无效，请发送 /m 重新打开。') };
+    if (parsed.name) return this.#showMenu(message, key, parsed.name);
+    const choice = this.#menus.take(key, message.senderId, parsed.number, parsed.token, this.#menuContext(key));
+    if (choice.error) return { message: choice.error };
+    const action = choice.action;
+    if (action.kind === 'section') return this.#showMenu(message, key, action.name);
+    if (action.kind === 'page') return this.#showMenu(message, key, '', qqMenuPage(action.list, action.page));
+    if (action.kind === 'archive') {
+      await this.#state.setIncludeArchivedSessions(action.include);
+      return this.#showMenu(message, key, 'main');
+    }
+    const command = action.text;
+    const pendingInteraction = this.#pendingInteractions.has(key) || this.#approvals.hasPending(key);
+    const isBusy = () => this.#queues.has(key) || this.#pendingInteractions.has(key)
+      || this.#approvals.hasPending(key) || this.#batchInputs.status(key).phase !== 'idle';
+    const needsIdle = /^\/(?:new|session|workspace|compact)(?:\s|$)/u.test(command);
+    if (isBusy() && needsIdle) {
+      return { message: t('当前任务仍在运行，请先停止任务或等待任务完成后再执行此操作。') };
+    }
+    const options = { signal: this.#signal, isDirect: message.kind === 'c2c', pendingInteraction,
+      control: { owner: this, key }, deferredDelivery: this.#deferred,
+      enhancement: captureContextEnhancementSource(
+        this.#contextEnhancement,
+        message.kind === 'c2c' ? 'direct' : 'group',
+        () => ({
+          channel: 'qq',
+          senderId: nonEmptyString(message.senderId),
+          senderName: message.kind === 'group' ? message.senderName : undefined,
+          chatId: message.kind === 'group' ? message.groupOpenid : message.senderId,
+        }),
+      ) };
+    // Existing runners own all Host mutations and control authorization.
+    const execute = async () => {
+      this.#signal?.throwIfAborted();
+      const current = this.#menuContext(key);
+      if (current.workspace !== choice.context.workspace
+        || current.sessionWorkspace !== choice.context.sessionWorkspace
+        || current.sessionId !== choice.context.sessionId) {
+        return { message: t('会话或工作区已变化，请重新发送 /m。') };
+      }
+      // A prompt may have started while this action waited for a prior menu command.
+      if (needsIdle && isBusy()) return { message: t('当前任务仍在运行，请先停止任务或等待任务完成后再执行此操作。') };
+      if (isControlCommand(command)) return runControlCommand(command, this.#harness, this.#state, key, options);
+      if (isModelCommand(command)) return runModelCommand(command, this.#harness, this.#state, key, options);
+      if (isPresetCommand(command)) return runPresetCommand(command, this.#harness, this.#state, key, options);
+      if (command === '/new') return withSessionBindingLock(this.#state, key, async () => {
+        if (isBusy()) return { message: t('当前任务仍在运行，请先停止任务或等待任务完成后再执行此操作。') };
+        const locked = this.#menuContext(key);
+        if (locked.workspace !== choice.context.workspace
+          || locked.sessionWorkspace !== choice.context.sessionWorkspace
+          || locked.sessionId !== choice.context.sessionId) {
+          return { message: t('会话或工作区已变化，请重新发送 /m。') };
+        }
+        await this.#state.clearSession(key);
+        return { message: t('已开启新会话。请发送你的问题。') };
+      });
+      if (command === '/compact') return runCompactCommand(command, this.#harness, this.#state, key, options);
+      return runWorkspaceCommand(command, this.#harness, key);
+    };
+    // Stop/steer must stay available while a slower menu mutation is pending.
+    if (isControlCommand(command)) return execute();
+    const previous = this.#menuTasks.get(key) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(execute);
+    this.#menuTasks.set(key, task);
+    try { return await task; }
+    finally { if (this.#menuTasks.get(key) === task) this.#menuTasks.delete(key); }
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -603,6 +820,7 @@ export class QqHarnessBridge {
       ...this.#approvalTasks,
       ...this.#commandTasks,
     ]);
+    await this.#deferred.whenIdle();
   }
 
   async #processFastCommand(message, messageId, key, text, runner) {
@@ -619,6 +837,17 @@ export class QqHarnessBridge {
       pendingInteraction: this.#pendingInteractions.has(key)
         || this.#approvals.hasPending(key),
       control: { owner: this, key },
+      deferredDelivery: this.#deferred,
+      enhancement: captureContextEnhancementSource(
+        this.#contextEnhancement,
+        message.kind === 'c2c' ? 'direct' : 'group',
+        () => ({
+          channel: 'qq',
+          senderId: nonEmptyString(message.senderId),
+          senderName: message.kind === 'group' ? message.senderName : undefined,
+          chatId: message.kind === 'group' ? message.groupOpenid : message.senderId,
+        }),
+      ),
     });
     if (result?.stopped) {
       await Promise.allSettled([
@@ -651,6 +880,34 @@ export class QqHarnessBridge {
       );
       await this.#bot.sendText(message.replyTarget, messageFailureText(failure))
         .catch(() => undefined);
+    }).finally(() => {
+      this.#acceptedMessageIds.delete(messageId);
+      this.#commandTasks.delete(task);
+    });
+    this.#commandTasks.add(task);
+    return task;
+  }
+
+  #finishAccessDecision(message, messageId, access) {
+    let task;
+    task = Promise.resolve().then(async () => {
+      if (this.#state.hasSeen(messageId)) return;
+      await this.#state.markSeen(messageId);
+      if (access.reason === 'command-not-allowed') {
+        this.#status.messagesReceived += 1;
+        this.#status.lastMessageAt = new Date().toISOString();
+        await this.#bot.sendText(message.replyTarget, t(COMMAND_PERMISSION_DENIED_MESSAGE));
+        this.#status.messagesReplied += 1;
+        this.#status.lastReplyAt = new Date().toISOString();
+      } else {
+        this.#status.messagesRejected += 1;
+        this.#status.lastRejectedAt = new Date().toISOString();
+      }
+      this.#status.lastError = null;
+    }).catch((error) => {
+      if (this.#signal?.aborted) return;
+      this.#status.lastError = error?.message ?? String(error);
+      this.#logger.error?.('[dsh-im:qq] failed to apply inbound access policy:', error);
     }).finally(() => {
       this.#acceptedMessageIds.delete(messageId);
       this.#commandTasks.delete(task);
@@ -721,11 +978,6 @@ export class QqHarnessBridge {
       await this.#state.markSeen(messageId);
       messageRecorded = true;
     };
-    if (this.#ownerUserOpenid !== '*' && sender !== this.#ownerUserOpenid) {
-      this.#status.messagesRejected += 1;
-      this.#status.lastRejectedAt = new Date().toISOString();
-      return;
-    }
     if (message.kind === 'group' && message.rawEventType !== 'GROUP_AT_MESSAGE_CREATE') return;
 
     const target = message.replyTarget;
@@ -734,10 +986,11 @@ export class QqHarnessBridge {
     const text = promptMessage.content;
     const hasImages = hasInboundImages(promptMessage);
     const hasFiles = hasInboundFiles(promptMessage);
+    const hasReply = hasReplyReference(promptMessage);
     let stream = null;
     let batchSettled = batchSubmission === null;
     try {
-      if (!text && !hasImages && !hasFiles) {
+      if (!text && !hasImages && !hasFiles && !hasReply) {
         await this.#bot.sendText(target, t('目前支持文字、图片和文件消息。'));
         await markMessageSeen();
         return;
@@ -785,16 +1038,20 @@ export class QqHarnessBridge {
         return;
       }
 
-      let content = hasImages
-        ? await promptContentForMessage(promptMessage, { signal: this.#signal })
+      let content = hasImages || hasReply
+        ? await promptContentForInboundMessage(promptMessage, { signal: this.#signal })
         : undefined;
       const snapshot = this.#acceptedMessageIds.get(messageId);
+      let contextEnhanced = false;
       if (snapshot) {
-        content = enhanceContextContent(content ?? text, snapshot, () => ({
+        const originalContent = content ?? text;
+        content = enhanceContextContent(originalContent, snapshot, () => ({
           channel: 'qq',
           senderId: sender,
           senderName: message.kind === 'group' ? message.senderName : undefined,
+          chatId: message.kind === 'group' ? message.groupOpenid : message.senderId,
         }));
+        contextEnhanced = content !== originalContent;
       }
       // QQ stream_messages can acknowledge a final frame without rendering it in
       // some C2C clients. Standard Markdown delivery is the reliable reply path.
@@ -806,10 +1063,15 @@ export class QqHarnessBridge {
         // redelivery after a failed error notice must never execute it twice.
         await markMessageSeen();
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
+          deferredDelivery: () => ({ coordinator: this.#deferred, target: { scope: target.scope, targetId: target.targetId } }),
           harness: this.#harness,
           state: this.#state,
           key,
-          ...(content !== undefined ? { content } : { text }),
+          text,
+          content,
+          titleText: batchSubmission?.title,
+          sourceGuidance: snapshot?.config?.guidance,
+          contextEnhanced,
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },
           askOptions: {

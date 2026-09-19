@@ -1,17 +1,20 @@
 import { createProductionController } from './production.mjs';
-import { installTelegramRpc } from './rpc.mjs';
+import { createTelegramRpcHandler, installTelegramRpc, TELEGRAM_RPC_CHANNEL } from './rpc.mjs';
+import { installProductionChannel } from '../shared/startup.mjs';
 
 export const name = 'dsh-im-telegram-host';
-export const inject = ['connection', 'credentials', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'credentials', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installTelegramRpc(ctx, config.controller, config.rpcAuthority);
   }
-  const production = await createProductionController(ctx, config, config.internals ?? {});
-  const disposeRpc = installTelegramRpc(ctx, production.controller, config.rpcAuthority);
-  ctx.effect(() => async () => production.close(), 'dsh-im: close Telegram bot connections');
-  return disposeRpc;
+  return installProductionChannel(ctx, config, {
+    channel: 'telegram',
+    rpcChannel: TELEGRAM_RPC_CHANNEL,
+    createProduction: () => createProductionController(ctx, config, config.internals ?? {}),
+    createHandler: controller => createTelegramRpcHandler(controller),
+  });
 }
 
 export function createTelegramHostPlugin(config) {

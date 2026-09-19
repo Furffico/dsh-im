@@ -23,7 +23,10 @@ import {
   inspectTelegramToken,
   validTelegramToken,
 } from '../../../src/channels/telegram/telegram-api.mjs';
-import { TelegramHarnessBridge } from '../../../src/channels/telegram/telegram-bridge.mjs';
+import {
+  TelegramHarnessBridge,
+  parseTelegramCardCallback,
+} from '../../../src/channels/telegram/telegram-bridge.mjs';
 import {
   TelegramBotClient,
   TelegramRuntime,
@@ -218,9 +221,10 @@ test('Telegram API registers the command menu and commands-type menu button', as
   await api.setChatMenuButton();
   assert.equal(calls.length, 2);
   assert.deepEqual(
-    TELEGRAM_COMMAND_MENU.filter(({ command }) => command === 'presetlist' || command === 'preset'),
+    TELEGRAM_COMMAND_MENU.filter(({ command }) => ['presetlist', 'presets', 'preset'].includes(command)),
     [
       { command: 'presetlist', description: '列出可用 Agent Preset' },
+      { command: 'presets', description: '列出可用 Agent Preset' },
       { command: 'preset', description: '查看或设置新会话 Agent Preset' },
     ],
   );
@@ -629,6 +633,7 @@ test('Telegram config and controller store only a credential reference in bot da
   const credentialStore = credentials();
   const runtimes = [];
   const connectionTests = [];
+  const proactiveSends = [];
   const controller = new TelegramController({
     credentials: credentialStore,
     configStore,
@@ -646,6 +651,10 @@ test('Telegram config and controller store only a credential reference in bot da
         async start() {},
         async stop() {},
         async sendConnectionTest(text) { connectionTests.push(text); },
+        async sendProactiveText(...args) {
+          proactiveSends.push(args);
+          return { sent: true };
+        },
       };
       runtimes.push(runtime);
       return runtime;
@@ -672,6 +681,11 @@ test('Telegram config and controller store only a credential reference in bot da
   await controller.sendConnectionTest(identity.botId);
   assert.match(connectionTests[0], /Harness Telegram/);
   assert.match(connectionTests[0], /123•••/);
+  const target = { kind: 'chat', route: { chatId: '123456' } };
+  assert.deepEqual(await controller.sendProactiveText(identity.botId, target, 'proactive-test'), {
+    sent: true,
+  });
+  assert.deepEqual(proactiveSends, [[target, 'proactive-test', {}]]);
   await controller.deleteBot(identity.botId);
   assert.equal(credentialStore.values.has(identity.tokenRef), false);
   assert.equal(controller.status().totals.configured, 0);
@@ -891,7 +905,7 @@ test('Telegram queued policy update cannot persist after controller close begins
   assert.equal(configStore.get(botId).allowedUsers, undefined);
 });
 
-test('Telegram RPC accepts only token binding and strips credential internals', async () => {
+test('Telegram RPC accepts the unified access policy and strips credential internals', async () => {
   const calls = [];
   const connectionTests = [];
   const controller = {
@@ -914,7 +928,7 @@ test('Telegram RPC accepts only token binding and strips credential internals', 
     }),
     sendConnectionTest: async (botId) => { connectionTests.push(botId); },
     deleteBot: async () => ({ bots: [], totals: { configured: 0, connected: 0 } }),
-    setAccessPolicy: async (botId, policy) => {
+    updateAccessPolicy: async (botId, policy) => {
       calls.push({ botId, policy });
       return {
         bots: [{ botId, accessPolicy: policy }],
@@ -962,28 +976,35 @@ test('Telegram RPC accepts only token binding and strips credential internals', 
     code: 'test-target-unavailable',
   });
 
+  const unifiedPolicy = {
+    direct: {
+      mode: 'allowlist',
+      open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+      allowlist: { users: [{ id: '6087707998', canExecuteCommands: true }] },
+    },
+    group: {
+      mode: 'open',
+      open: { defaultCanExecuteCommands: true, commandPermissionOverrides: [] },
+      allowlist: { users: [] },
+    },
+  };
   const access = await handler(TELEGRAM_ENDPOINTS.setAccessPolicy, {
     botId: 'telegram_123',
-    accessMode: TELEGRAM_ACCESS_MODES.privateAllowlist,
-    allowedUsers: ['6087707998', '6087707998'],
+    policy: unifiedPolicy,
   });
   assert.equal(access.ok, true);
   assert.deepEqual(calls.at(-1), {
     botId: 'telegram_123',
-    policy: {
-      accessMode: TELEGRAM_ACCESS_MODES.privateAllowlist,
-      allowedUsers: ['6087707998'],
-    },
+    policy: unifiedPolicy,
   });
   assert.equal((await handler(TELEGRAM_ENDPOINTS.setAccessPolicy, {
     botId: 'telegram_123',
     accessMode: TELEGRAM_ACCESS_MODES.privateAllowlist,
-    allowedUsers: ['@username'],
+    allowedUsers: ['6087707998'],
   })).error.code, 'bad-request');
   assert.equal((await handler(TELEGRAM_ENDPOINTS.setAccessPolicy, {
     botId: 'telegram_123',
-    accessMode: TELEGRAM_ACCESS_MODES.compatible,
-    allowedUsers: [],
+    policy: unifiedPolicy,
     extra: true,
   })).error.code, 'bad-request');
 });
@@ -998,7 +1019,7 @@ test('shared token RPC never sends a connection test after reconnect is cancelle
     reconnectBot: async () => reconnect,
     sendConnectionTest: async () => { sendCalls += 1; },
     deleteBot: async () => ({ bots: [] }),
-    setAccessPolicy: async () => ({ bots: [] }),
+    updateAccessPolicy: async () => ({ bots: [] }),
   };
   const abort = new AbortController();
   const result = createTelegramRpcHandler(controller)(TELEGRAM_ENDPOINTS.reconnectBot, {
@@ -1076,6 +1097,152 @@ test('Telegram normalizes private messages and requires an explicit group addres
   assert.equal(topicTwo.replyTarget.messageThreadId, 200);
   assert.deepEqual(topicOne.reactionTarget, { chatId: -1001, messageId: 6 });
   assert.deepEqual(topicTwo.reactionTarget, { chatId: -1001, messageId: 7 });
+});
+
+for (const field of ['text', 'caption']) {
+  test(`Telegram preserves Unicode offsets and username boundaries in ${field}`, () => {
+    for (const [input, expected] of [
+      ['İ @test_bot hello', 'İ  hello'],
+      ['İ @test_botX hello', 'İ @test_botX hello'],
+      ['İ @test_bot_2 hello', 'İ @test_bot_2 hello'],
+      ['İ @test_bot1 hello', 'İ @test_bot1 hello'],
+      ['İİ @TeSt_BoT /new', 'İİ  /new'],
+      ['😀İ @TEST_BOT, 你好', '😀İ , 你好'],
+      ['@test_bot İ @TeSt_BoT hello', 'İ  hello'],
+      ['İ @test_bot', 'İ'],
+      ['你好 @TeSt_BoT hello', '你好  hello'],
+      ['İ @other_bot hello', 'İ @other_bot hello'],
+    ]) {
+      const message = normalizeTelegramUpdate({
+        update_id: 1,
+        message: {
+          message_id: 1,
+          chat: { id: 88, type: 'private' },
+          from: { id: 42, is_bot: false },
+          [field]: input,
+        },
+      }, { botId: '123456789', username: 'test_bot' });
+      assert.equal(message.content, expected, `${field}: ${input}`);
+    }
+  });
+}
+
+test('Telegram maps one reply_to_message snapshot without expanding nested replies', () => {
+  const replied = normalizeTelegramUpdate({
+    update_id: 14,
+    message: {
+      message_id: 8,
+      chat: { id: -1001, type: 'supergroup' },
+      from: { id: 43, is_bot: false },
+      text: '这张图说明什么？',
+      reply_to_message: {
+        message_id: 7,
+        chat: { id: -1001, type: 'supergroup' },
+        from: { id: 123456789, is_bot: true, first_name: 'Harness', last_name: 'Bot' },
+        caption: '第一层原文',
+        photo: [{ file_id: 'photo-large', file_unique_id: 'quoted-photo', file_size: 2_000 }],
+        reply_to_message: { message_id: 6, text: '不应递归进入 Prompt' },
+      },
+    },
+  }, { botId: '123456789', username: 'HarnessBot' });
+  assert.equal(replied.addressed, true);
+  assert.deepEqual(replied.replyTo, {
+    messageId: '7',
+    authorId: '123456789',
+    authorName: 'Harness Bot',
+    content: '第一层原文',
+    attachments: [{ kind: 'image' }],
+  });
+  assert.doesNotMatch(JSON.stringify(replied.replyTo), /不应递归/);
+
+  const documentReply = normalizeTelegramUpdate({
+    update_id: 15,
+    message: {
+      message_id: 9,
+      chat: { id: 88, type: 'private' },
+      from: { id: 42, is_bot: false },
+      text: '总结附件',
+      reply_to_message: {
+        message_id: 5,
+        from: { id: 41, username: 'alice' },
+        document: { file_id: 'quoted-pdf', file_name: 'brief.pdf', mime_type: 'application/pdf' },
+      },
+    },
+  }, { botId: '123456789', username: 'HarnessBot' });
+  assert.deepEqual(documentReply.replyTo.attachments, [{ kind: 'file', name: 'brief.pdf' }]);
+  assert.equal(documentReply.replyTo.authorName, 'alice');
+
+  const stickerReply = normalizeTelegramUpdate({
+    update_id: 18,
+    message: {
+      message_id: 12,
+      chat: { id: 88, type: 'private' },
+      from: { id: 42, is_bot: false },
+      text: '这个贴纸是什么意思？',
+      reply_to_message: {
+        message_id: 6,
+        from: { id: 41, username: 'alice' },
+        sticker: { file_id: 'opaque-sticker-id', file_unique_id: 'opaque-unique-id' },
+      },
+    },
+  }, { botId: '123456789', username: 'HarnessBot' });
+  assert.deepEqual(stickerReply.replyTo.attachments, [{ kind: 'image' }]);
+});
+
+test('Telegram uses TextQuote and bounded history loading when reply_to_message omits text', async () => {
+  let loads = 0;
+  const quoted = normalizeTelegramUpdate({
+    update_id: 16,
+    message: {
+      message_id: 10,
+      chat: { id: 88, type: 'private' },
+      from: { id: 42, is_bot: false },
+      text: '说的是什么内容？',
+      quote: { text: '明白了——是记录/标记用途。' },
+      reply_to_message: {
+        message_id: 323,
+        date: 1_788_118_330,
+        from: { id: 123456789, is_bot: true, first_name: '今天是梁子' },
+      },
+    },
+  }, {
+    botId: '123456789',
+    username: 'HarnessBot',
+    loadReplyContent: async () => { loads += 1; return { content: '不应读取历史' }; },
+  });
+  assert.equal(quoted.replyTo.content, '明白了——是记录/标记用途。');
+  assert.equal(Object.hasOwn(quoted.replyTo, 'load'), false);
+  assert.equal(loads, 0);
+
+  let loadedReference;
+  const historyBacked = normalizeTelegramUpdate({
+    update_id: 17,
+    message: {
+      message_id: 11,
+      chat: { id: 88, type: 'private' },
+      from: { id: 42, is_bot: false },
+      text: '老消息说了什么？',
+      reply_to_message: {
+        message_id: 322,
+        date: 1_788_118_320,
+        from: { id: 123456789, is_bot: true, first_name: '今天是梁子' },
+      },
+    },
+  }, {
+    botId: '123456789',
+    username: 'HarnessBot',
+    loadReplyContent: async (reference) => {
+      loadedReference = reference;
+      return { content: '从当前会话历史恢复的正文' };
+    },
+  });
+  assert.equal(typeof historyBacked.replyTo.load, 'function');
+  assert.deepEqual(await historyBacked.replyTo.load({}), { content: '从当前会话历史恢复的正文' });
+  assert.deepEqual(loadedReference, {
+    conversationKey: 'direct:88',
+    messageId: '322',
+    createdAt: 1_788_118_320_000,
+  });
 });
 
 test('Telegram compatible mode preserves old routing and private allowlist mode restricts inbound messages', () => {
@@ -1351,6 +1518,10 @@ test('Telegram runtime validates webhook state and starts a cancellable long pol
         reject(new DOMException('Aborted', 'AbortError'));
       }, { once: true }));
     },
+    sendMessage: async (request) => {
+      calls.push({ method: 'sendMessage', ...request });
+      return { message_id: 900 };
+    },
   };
   const runtime = new TelegramRuntime({
     config: {
@@ -1366,12 +1537,116 @@ test('Telegram runtime validates webhook state and starts a cancellable long pol
   await runtime.start();
   assert.equal(runtime.status.ready, true);
   assert.equal(runtime.status.connectionState, 'connected');
+  assert.deepEqual(await runtime.sendProactiveText({
+    kind: 'topic',
+    route: { chatId: '-1001234567890', messageThreadId: 42 },
+  }, 'proactive-test'), { providerMessageIds: ['900'] });
+  const proactiveCall = calls.find(({ method }) => method === 'sendMessage');
+  assert.equal(proactiveCall.chatId, -1001234567890);
+  assert.equal(proactiveCall.messageThreadId, 42);
+  assert.equal(proactiveCall.replyToMessageId, undefined);
+  assert.equal(proactiveCall.text, 'proactive-test');
   await runtime.stop();
   assert.equal(runtime.status.ready, false);
   assert.deepEqual(calls[0], { method: 'setMyCommands', commands: TELEGRAM_COMMAND_MENU });
   assert.deepEqual(calls[1], { method: 'setChatMenuButton', menuButton: COMMANDS_MENU_BUTTON });
   assert.deepEqual(calls[2], { method: 'getUpdates', offset: -1, timeout: 0 });
   await rm(directory, { recursive: true, force: true });
+});
+
+test('Telegram runtime recovers an old bot reply from its bound Session history', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-telegram-reply-history-'));
+  const state = await new TelegramStateStore(join(directory, 'state.json')).load();
+  await state.setSession('direct:88', 'session-reply-history');
+  const quotedAt = Math.floor((Date.now() - 5_000) / 1_000) * 1_000;
+  let delivered = false;
+  let prompt;
+  const runtime = new TelegramRuntime({
+    config: {
+      botId: 'telegram_reply_history',
+      platformId: '123456789',
+      username: 'HarnessBot',
+    },
+    token: TOKEN,
+    harness: {
+      ensureRunning: async () => true,
+      workspaceSession: () => ({
+        sessionExists: async () => true,
+        readHistory: async () => ({
+          events: [
+            { event: { type: 'turn/start', seq: 1, time: quotedAt - 1_000, data: { turn: 3 } } },
+            { event: {
+              type: 'assistant/message',
+              seq: 2,
+              time: quotedAt,
+              data: {
+                turn: 3,
+                message: { content: [{ type: 'text', text: 'Telegram 老消息正文' }] },
+              },
+            } },
+            { event: {
+              type: 'turn/end',
+              seq: 3,
+              time: quotedAt + 1,
+              data: { turn: 3, reason: { kind: 'completed' } },
+            } },
+          ],
+          hasMore: false,
+        }),
+        ask: async (content) => { prompt = content; return '已识别 Telegram 引用'; },
+      }),
+    },
+    state,
+    createApi: () => ({
+      getMe: async () => ({ id: 123456789, is_bot: true }),
+      getWebhookInfo: async () => ({ url: '' }),
+      setMyCommands: async () => true,
+      setChatMenuButton: async () => true,
+      getUpdates: async ({ timeout, signal }) => {
+        if (timeout === 0) return [];
+        if (!delivered) {
+          delivered = true;
+          return [{
+            update_id: 0,
+            message: {
+              message_id: 400,
+              chat: { id: 88, type: 'private' },
+              from: { id: 42, is_bot: false },
+              text: '这条老消息说了什么？',
+              reply_to_message: {
+                message_id: 323,
+                date: quotedAt / 1_000,
+                from: { id: 123456789, is_bot: true, first_name: '今天是梁子' },
+              },
+            },
+          }];
+        }
+        return new Promise((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+      setMessageReaction: async () => true,
+      sendChatAction: async () => true,
+      sendRichMessageDraft: async () => true,
+      sendRichMessage: async () => ({ message_id: 401 }),
+      sendMessage: async () => ({ message_id: 401 }),
+      editMessageText: async () => true,
+    }),
+  });
+
+  try {
+    await runtime.start();
+    await bounded((async () => {
+      while (state.cursor() !== 1 || prompt === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })(), 'Telegram reply history was not processed');
+    assert.match(prompt[0].text, /"content":"Telegram 老消息正文"/);
+    assert.doesNotMatch(prompt[0].text, /unavailableReason/);
+  } finally {
+    await runtime.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('Telegram runtime still starts when the command menu setup fails', async () => {
@@ -1422,7 +1697,7 @@ test('Telegram runtime still starts when the command menu setup fails', async ()
   }
 });
 
-test('Telegram runtime enforces the selected bot private allowlist', async () => {
+test('Telegram runtime enforces the unified direct and group access policy', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-im-telegram-allowlist-runtime-'));
   const state = await new TelegramStateStore(join(directory, 'state.json')).load();
   const asked = [];
@@ -1484,8 +1759,10 @@ test('Telegram runtime enforces the selected bot private allowlist', async () =>
       botId: 'telegram_allowlist',
       platformId: '123456789',
       username: 'HarnessBot',
+      // Kept deliberately contradictory: legacy fields are migration input,
+      // not a second active Runtime gate after unified policy injection.
       accessMode: TELEGRAM_ACCESS_MODES.privateAllowlist,
-      allowedUsers: ['7'],
+      allowedUsers: ['999'],
     },
     token: TOKEN,
     harness: {
@@ -1497,6 +1774,20 @@ test('Telegram runtime enforces the selected bot private allowlist', async () =>
       },
     },
     state,
+    accessPolicy: {
+      getSettings: () => ({
+        direct: {
+          mode: 'allowlist',
+          open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+          allowlist: { users: [{ id: '7', canExecuteCommands: true }] },
+        },
+        group: {
+          mode: 'allowlist',
+          open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+          allowlist: { users: [] },
+        },
+      }),
+    },
     createApi: () => fakeApi,
   });
 
@@ -1532,7 +1823,8 @@ for (const scenario of [
     let settingsReads = 0;
     let nextMessageId = 500;
     const configFor = ([directEnabled, groupEnabled], guidance) => ({
-      directEnabled, groupEnabled, fields: ['channel', 'botId'], guidance,
+      group: { enabled: groupEnabled, fields: ['channel', 'botId'], guidance },
+      direct: { enabled: directEnabled, fields: ['channel', 'botId'], guidance },
     });
     let config = configFor(scenario.before, 'before cursor write');
     const update = (id, kind) => ({
@@ -1803,6 +2095,175 @@ test('Telegram runtime keeps polling while a Harness question waits for its answ
       sessionId: 'session-runtime-interaction',
       text: '请先询问测试环境',
     }]);
+  } finally {
+    releaseTurn.resolve();
+    await runtime.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Telegram runtime answers a question from an inline-keyboard press', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-telegram-card-'));
+  const state = await new TelegramStateStore(join(directory, 'state.json')).load();
+  const questionSent = deferred();
+  const answerSubmitted = deferred();
+  const releaseTurn = deferred();
+  const sent = [];
+  const acknowledgements = [];
+  const keyboardEdits = [];
+  let answerUpdateDelivered = false;
+  let cardMessageId = null;
+  let pressedData = null;
+  let nextOutboundMessageId = 900;
+
+  const promptUpdate = {
+    update_id: 10,
+    message: {
+      message_id: 100,
+      chat: { id: 42, type: 'private' },
+      from: { id: 7, is_bot: false },
+      text: '请先询问测试环境',
+    },
+  };
+  const fakeApi = {
+    getMe: async () => ({ id: 123456789, is_bot: true }),
+    getWebhookInfo: async () => ({ url: '' }),
+    getUpdates: async ({ offset, timeout, signal }) => {
+      if (timeout === 0) return [];
+      if (offset <= 0) return [promptUpdate];
+      if (offset === 11) {
+        await questionSent.promise;
+        answerUpdateDelivered = true;
+        return [{
+          update_id: 11,
+          callback_query: {
+            id: 'cb-1',
+            from: { id: 7, is_bot: false, first_name: 'Wings' },
+            message: {
+              message_id: cardMessageId,
+              chat: { id: 42, type: 'private' },
+            },
+            data: pressedData,
+          },
+        }];
+      }
+      return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+    sendChatAction: async () => true,
+    sendMessage: async ({ text, replyMarkup }) => {
+      const messageId = nextOutboundMessageId;
+      nextOutboundMessageId += 1;
+      sent.push({ text, replyMarkup });
+      if (replyMarkup) {
+        cardMessageId = messageId;
+        // Press the second option (生产环境) exactly as a client would.
+        pressedData = replyMarkup.inline_keyboard[1][0].callback_data;
+        questionSent.resolve();
+      }
+      return { message_id: messageId };
+    },
+    answerCallbackQuery: async (payload) => { acknowledgements.push(payload); return true; },
+    editMessageReplyMarkup: async (payload) => { keyboardEdits.push(payload); return true; },
+    setMessageReaction: async () => true,
+  };
+  const harness = {
+    ensureRunning: async () => true,
+    createSession: async () => 'session-card-interaction',
+    ask: async (sessionId, text, options) => {
+      assert.equal(text, '请先询问测试环境');
+      await options.onInteraction({
+        kind: 'question',
+        interactionId: 'telegram-card-question',
+        rpcId: 'telegram-card-question',
+        sessionId,
+        payload: {
+          type: 'question/requested',
+          sessionId,
+          questions: [{
+            id: 'environment',
+            question: '请选择测试环境',
+            options: [{ label: '测试环境' }, { label: '生产环境' }],
+          }],
+        },
+        respond: async (result) => {
+          assert.equal(answerUpdateDelivered, true);
+          answerSubmitted.resolve(result);
+          return { accepted: true };
+        },
+      });
+      await answerSubmitted.promise;
+      await releaseTurn.promise;
+      return '已选择生产环境';
+    },
+  };
+  const runtime = new TelegramRuntime({
+    config: {
+      botId: 'telegram_card',
+      platformId: '123456789',
+      username: 'HarnessBot',
+    },
+    token: TOKEN,
+    harness,
+    state,
+    createApi: () => fakeApi,
+    logger: { error() {}, warn() {} },
+    allowedPrivateUserIds: ['7'],
+  });
+
+  try {
+    await runtime.start();
+    const submitted = await bounded(
+      answerSubmitted.promise,
+      'the button press did not submit a structured answer',
+    );
+    assert.deepEqual(submitted, {
+      ok: true,
+      value: {
+        sessionId: 'session-card-interaction',
+        answer: { answers: [{ id: 'environment', selected: ['生产环境'] }] },
+      },
+    });
+
+    // The question ships as a keyboard card, one button per option, each carrying
+    // the presentation nonce alongside its indexes.
+    const card = sent.find((entry) => entry.replyMarkup);
+    assert.ok(card, 'the question must be delivered with an inline keyboard');
+    const rows = card.replyMarkup.inline_keyboard;
+    assert.deepEqual(rows.map((row) => row[0].text), ['测试环境', '生产环境']);
+    const encoded = rows.map((row) => parseTelegramCardCallback(row[0].callback_data));
+    assert.ok(encoded.every(Boolean), 'every button must encode a press');
+    assert.deepEqual(encoded.map((entry) => entry.questionIndex), [0, 0]);
+    assert.deepEqual(encoded.map((entry) => entry.optionIndex), [0, 1]);
+    assert.equal(new Set(encoded.map((entry) => entry.nonce)).size, 1, 'one card, one identity');
+    assert.match(card.text, /请选择测试环境/);
+
+    // The press is acknowledged, and its keyboard is retired so it cannot replay.
+    // acceptCallback runs detached from the poll loop, so let its tail settle.
+    await bounded((async () => {
+      while (acknowledgements.length === 0 || keyboardEdits.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })(), 'the press was never acknowledged or its keyboard retired');
+    assert.equal(acknowledgements.length, 1);
+    assert.equal(acknowledgements[0].callbackQueryId, 'cb-1');
+    assert.match(acknowledgements[0].text, /生产环境/);
+    assert.equal(keyboardEdits.length, 1);
+    assert.equal(keyboardEdits[0].chatId, 42);
+    assert.equal(keyboardEdits[0].messageId, cardMessageId);
+    assert.deepEqual(keyboardEdits[0].replyMarkup, { inline_keyboard: [] });
+
+    await bounded((async () => {
+      while (state.cursor() !== 12) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })(), 'the cursor did not advance past the press update');
+    assert.equal(state.hasSeen('11'), true);
   } finally {
     releaseTurn.resolve();
     await runtime.stop();

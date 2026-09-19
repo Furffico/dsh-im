@@ -241,6 +241,22 @@ export class TokenBotController {
     });
   }
 
+  async sendProactiveText(botId, target, text, options = {}) {
+    const config = this.#configStore.get(botId);
+    if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      if (!runtime?.status?.ready || typeof runtime.sendProactiveText !== 'function') {
+        const error = new Error(t('{label}机器人尚未连接', {
+          label: this.#descriptor.label,
+        }));
+        error.code = 'bot-not-connected';
+        throw error;
+      }
+      return runtime.sendProactiveText(target, text, options);
+    });
+  }
+
   async deleteBot(botId) {
     const config = this.#configStore.get(botId);
     if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);
@@ -320,6 +336,32 @@ export class TokenBotController {
       bots,
       totals: { configured: bots.length, connected: connectedCount },
     };
+  }
+
+  /**
+   * Re-synchronize the platform-side command menu of every connected bot.
+   *
+   * Called when the host message language changes: a menu the platform stored
+   * at connect time would otherwise keep the previous language until the bot
+   * reconnected. Runtimes of channels without a platform-side menu expose no
+   * refresh hook and are skipped, and one bot's failure never hides the rest.
+   * @returns the number of bots that accepted a refreshed menu.
+   */
+  async refreshCommandMenus() {
+    if (this.#closed) return 0;
+    const refreshed = await Promise.all([...this.#runtimes].map(async ([botId, runtime]) => {
+      if (typeof runtime?.refreshCommandMenu !== 'function') return false;
+      try {
+        return await runtime.refreshCommandMenu() === true;
+      } catch (error) {
+        this.#logger.warn?.(
+          `[dsh-im:${this.#descriptor.key}] bot ${botId} command menu refresh failed:`,
+          error,
+        );
+        return false;
+      }
+    }));
+    return refreshed.filter(Boolean).length;
   }
 
   async close() {

@@ -1,4 +1,10 @@
+import { createDeferredDeliveryCoordinator, deferredOutcomeText } from '../shared/deferred-delivery-coordinator.mjs';
 import { generateReqId } from '@wecom/aibot-node-sdk';
+import { randomUUID } from 'node:crypto';
+import { wecomSendDiagnostic, wecomSendError } from './send-error.mjs';
+import {
+  parseWecomMenu, wecomList, wecomMenu, wecomMenuText, wecomSettings, wecomTemplateCard,
+} from './wecom-cards.mjs';
 import {
   harnessAnswerForQuestion,
   harnessQuestionText,
@@ -25,15 +31,18 @@ import {
   isPresetCommand,
   runPresetCommand,
 } from '../shared/preset-command.mjs';
-import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
+import { runWorkspaceCommand, workspacePathSnapshot } from '../shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
-import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
+import {
+  captureContextEnhancement,
+  captureContextEnhancementSource,
+  enhanceContextContent,
+} from '../shared/context-enhancement.mjs';
 import {
   hasInboundImages,
   ImagePromptError,
   imagePromptDiagnostic,
   imagePromptUserMessage,
-  promptContentForMessage,
 } from '../shared/image-prompt.mjs';
 import {
   hasInboundFiles,
@@ -43,14 +52,21 @@ import { rememberConnectionTestTarget } from '../shared/connection-test.mjs';
 import { trackOutboundArtifactProviderPromise } from '../shared/semantic/artifact.mjs';
 import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
 import {
+  hasReplyReference,
+  promptContentForInboundMessage,
+} from '../shared/semantic/reply-reference.mjs';
+import {
   createDeliveryReceipt,
 } from '../shared/semantic/delivery.mjs';
 import {
-  channelDeliveryFailure,
   clearLastMessageFailure,
   messageFailureText,
   setLastMessageFailure,
 } from '../shared/message-failure.mjs';
+import {
+  COMMAND_PERMISSION_DENIED_MESSAGE,
+  evaluateInboundAccess,
+} from '../shared/inbound-access.mjs';
 import { t } from '../shared/i18n.mjs';
 
 const DEFAULT_FILE_UPLOAD_TIMEOUT_MS = 120_000;
@@ -61,19 +77,22 @@ function helpText() {
     t('企业微信机器人已连接 DeepSeek Harness。'),
     '',
     t('直接发送文字、图片或文件即可继续当前会话。'),
+    t('/menu 或 /m  打开可点击的功能菜单'),
     t('/new  开启一个全新会话'),
     t('/compact  压缩当前会话的较早上下文'),
     t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
-    t('/workspace 工作区绝对路径  切换工作区'),
+    t('/workspace 工作区序号或绝对路径  切换工作区'),
     t('/workspacelist  列出工作区绝对路径'),
-    t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/ws、/wsl、/workspaces  工作区命令别名'),
+    t('/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/sessionlist --limit N  仅列出当前工作区前 N 个会话'),
     t('/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话'),
     t('/models  按序号列出所有可用模型'),
     t('/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级'),
     t('/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级'),
     t('/model [序号或完整模型ID] [推理等级ID]  查看或切换当前会话模型'),
     t('示例：先发 /models，再发 /model 2 [推理等级ID]'),
-    t('/presetlist  按序号列出可用 Agent Preset'),
+    t('/presetlist 或 /presets  按序号列出可用 Agent Preset'),
     t('/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset'),
     t('纯数字 ID：/preset id:<ID>'),
     t('/preset --default  跟随 Host 默认'),
@@ -104,8 +123,7 @@ function conversationKey(frame) {
   return body.chattype === 'group' ? `group:${body.chatid}` : `direct:${body.from?.userid}`;
 }
 
-function messageText(frame) {
-  const body = bodyOf(frame);
+function messageContentText(body) {
   let text = '';
   if (body.msgtype === 'text') {
     text = typeof body.text?.content === 'string' ? body.text.content.trim() : '';
@@ -118,6 +136,12 @@ function messageText(frame) {
       .join('\n')
       .trim();
   }
+  return text;
+}
+
+function messageText(frame) {
+  const body = bodyOf(frame);
+  const text = messageContentText(body);
   // Group callbacks retain the leading @bot mention that caused delivery.
   // It is routing metadata rather than part of the user's prompt or answer.
   return body.chattype === 'group'
@@ -139,6 +163,36 @@ function fileContents(frame) {
   return body.msgtype === 'file' && body.file && typeof body.file === 'object'
     ? [body.file]
     : [];
+}
+
+function quoteAttachments(quote) {
+  if (quote?.msgtype === 'image') return [{ kind: 'image' }];
+  if (quote?.msgtype === 'voice') return [{ kind: 'audio' }];
+  if (quote?.msgtype === 'file') {
+    const name = nonEmptyString(
+      quote.file?.filename ?? quote.file?.file_name ?? quote.file?.name,
+    );
+    return [{ kind: 'file', ...(name ? { name } : {}) }];
+  }
+  if (quote?.msgtype !== 'mixed' || !Array.isArray(quote.mixed?.msg_item)) return [];
+  return quote.mixed.msg_item
+    .filter((item) => item?.msgtype === 'image')
+    .map(() => ({ kind: 'image' }));
+}
+
+function replyReferenceForBody(body) {
+  const quote = body?.quote;
+  if (!quote || typeof quote !== 'object') return null;
+  const content = messageContentText(quote);
+  const attachments = quoteAttachments(quote);
+  const supported = ['text', 'image', 'mixed', 'voice', 'file'].includes(quote.msgtype);
+  return {
+    ...(content ? { content } : {}),
+    ...(attachments.length > 0 ? { attachments } : {}),
+    ...(!content && attachments.length === 0
+      ? { unavailableReason: supported ? 'not-delivered' : 'unsupported' }
+      : {}),
+  };
 }
 
 function imageSource(client, image) {
@@ -196,10 +250,13 @@ function fileSource(client, file) {
 }
 
 export function wecomInboundMessage(frame, client) {
+  const body = bodyOf(frame);
+  const replyTo = replyReferenceForBody(body);
   return {
     content: messageText(frame),
     images: imageContents(frame).map((image) => imageSource(client, image)).filter(Boolean),
     files: fileContents(frame).map((file) => fileSource(client, file)).filter(Boolean),
+    ...(replyTo ? { replyTo } : {}),
   };
 }
 
@@ -305,15 +362,17 @@ function thinkingProgressText(update) {
 }
 
 function streamContent(thinkingText, answerText = '', { finish = false } = {}) {
+  const answer = String(answerText ?? '').trim();
+  // Progress is transient: the final frame must contain only the delivered text.
+  if (finish) return answer;
+
   const thinking = String(thinkingText ?? '')
     .replace(/<\/?think>/gi, '')
     .trim();
-  const answer = String(answerText ?? '').trim();
   if (!thinking) return answer;
-  const thinkBlock = finish || answer
-    ? `<think>${thinking}</think>`
+  return answer
+    ? `<think>${thinking}</think>\n${answer}`
     : `<think>${thinking}`;
-  return answer ? `${thinkBlock}\n${answer}` : thinkBlock;
 }
 
 function artifactFailureText(fileName, error) {
@@ -489,7 +548,9 @@ export class WecomHarnessBridge {
   #client;
   #harness;
   #state;
+  #deferred;
   #contextEnhancement;
+  #accessPolicy;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -506,12 +567,16 @@ export class WecomHarnessBridge {
   #approvals;
   #batchInputs = new BatchInputManager();
   #prefetchedImageCount = 0;
+  #menus = new Map();
+  #eventIds = new Set();
+  #cardFrames = new WeakSet();
 
   constructor({
     client,
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     status = createWecomBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -530,17 +595,275 @@ export class WecomHarnessBridge {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#generateReqId = generateStreamId;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
     this.#signal = signal;
+    this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
+      deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
+    });
     this.#approvals = new HarnessApprovalQueue({ label: 'wecom', logger });
   }
 
   get status() {
     return structuredClone(this.#status);
+  }
+
+  async #showMain(frame) {
+    const previousFailure = this.#status.lastMessageError;
+    const key = conversationKey(frame);
+    const workspace = this.#harness.currentWorkspace?.();
+    const sessionId = this.#state.sessionFor(key);
+    const options = { signal: this.#signal };
+    const settled = await Promise.allSettled([
+      workspacePathSnapshot(this.#harness, options),
+      this.#harness.listWorkspaceSessions?.(workspace, options),
+      (async () => {
+        const session = sessionId ? this.#harness.workspaceSession?.(sessionId, key) : null;
+        return typeof session?.models === 'function'
+          ? session.models(options) : this.#harness.listModels?.(options);
+      })(),
+      this.#harness.agentPresetSettings?.(options),
+    ]);
+    this.#signal?.throwIfAborted();
+    const [paths, listed, catalog, settings] = settled.map((result) => result.status === 'fulfilled' ? result.value : null);
+    const sessions = (listed?.sessions ?? []).map((item) => [item.title || t('暂无标题'), `/session ${item.sessionId}`]);
+    const models = (catalog?.groups ?? []).flatMap((group) => group.models.map((model) => [
+      `${model.name} (${group.id})`, `/model ${group.id}/${model.id}`,
+    ]));
+    const presets = [[t('跟随 Host 默认'), '/preset --default'], ...(settings?.agentPresetCatalog?.items ?? []).map((item) => [
+      item.label || item.id, `/preset ${/^\d+$/u.test(item.id) ? 'id:' : ''}${item.id}`,
+    ])];
+    const currentPreset = settings?.agentPreset;
+    const settingsMenu = wecomSettings({
+      sessions, models, presets, sessionId,
+      currentModel: catalog?.current ? `/model ${catalog.current.provider}/${catalog.current.model}` : null,
+      currentPreset: currentPreset ? `/preset ${/^\d+$/u.test(currentPreset) ? 'id:' : ''}${currentPreset}` : '/preset --default',
+      presetLabel: settings?.agentPresetCatalog?.items.find((item) => item.id === currentPreset)?.label,
+    });
+    await this.#sendMenu(frame, settingsMenu);
+    await this.#sendMenu(frame, wecomMenu({ workspace,
+      workspaces: (paths?.paths ?? (workspace ? [workspace] : [])).map((path) => [path, `/workspace ${path}`]),
+    }), { active: true });
+    this.#clearMenuFailure(previousFailure);
+  }
+
+  #clearMenuFailure(previousFailure) {
+    // Do not clear a model failure or one recorded by a concurrent request.
+    if (previousFailure?.reason === 'WECOM_MENU_DELIVERY'
+      && this.#status.lastMessageError === previousFailure) {
+      clearLastMessageFailure(this.#status);
+      this.#status.lastError = null;
+    }
+  }
+
+  #rememberMenu(frame, menu) {
+    const taskId = `menu_${randomUUID()}`;
+    const now = Date.now();
+    for (const [id, entry] of this.#menus) {
+      if (entry.expiresAt <= now) this.#menus.delete(id);
+    }
+    while (this.#menus.size >= 256) this.#menus.delete(this.#menus.keys().next().value);
+    this.#menus.set(taskId, {
+      menu, key: conversationKey(frame),
+      workspace: this.#harness.currentWorkspace?.(), expiresAt: now + 30 * 60_000,
+    });
+    return wecomTemplateCard(menu, taskId);
+  }
+
+  async #sendMenu(frame, menu, { active = false } = {}) {
+    this.#signal?.throwIfAborted();
+    const body = bodyOf(frame);
+    const chatId = body.chattype === 'group' ? body.chatid : body.from.userid;
+    const card = this.#rememberMenu(frame, menu);
+    const operation = active || this.#cardFrames.has(frame) ? 'sendMessage' : 'replyTemplateCard';
+    try {
+      if (active || this.#cardFrames.has(frame)) {
+        await this.#client.sendMessage(chatId, { msgtype: 'template_card', template_card: card });
+      } else {
+        await this.#client.replyTemplateCard(frame, card);
+      }
+    } catch (cause) {
+      const error = wecomSendError(cause, operation);
+      // A timed-out card may already be visible and must remain usable.
+      if (error.code !== 'channel-delivery-uncertain') this.#menus.delete(card.task_id);
+      // Only a definite card rejection can safely fall back to text.
+      if (error.code !== 'channel-delivery-failed' || error.providerCode === undefined) throw error;
+      this.#logger.warn?.('[dsh-im:wecom] menu delivery failed; using text:', wecomSendDiagnostic(error));
+      await this.#sendImmediate(frame, chatId, wecomMenuText(menu));
+    }
+  }
+
+  acceptEvent(frame) {
+    const body = bodyOf(frame);
+    const id = nonEmptyString(body.msgid);
+    if (this.#signal?.aborted || !id || this.#eventIds.has(id) || this.#state.hasSeen(id)) {
+      return Promise.resolve();
+    }
+    this.#eventIds.add(id);
+    let task;
+    task = this.#processEvent(frame).catch((error) => {
+      if (this.#signal?.aborted) return;
+      this.#status.lastError = error?.message ?? String(error);
+      const failure = setLastMessageFailure(this.#status, error, {
+        reason: error?.wecomOperation ? 'wecom-menu-delivery' : undefined,
+      });
+      this.#logger.warn?.(`[dsh-im:wecom] menu event failed [${failure.referenceId}]`, wecomSendDiagnostic(error));
+    }).finally(() => {
+      this.#eventIds.delete(id);
+      this.#commandTasks.delete(task);
+    });
+    this.#commandTasks.add(task);
+    return task;
+  }
+
+  async #processEvent(frame) {
+    const body = bodyOf(frame);
+    const senderId = nonEmptyString(body.from?.userid);
+    const type = body.event?.eventtype;
+    if (!senderId || type !== 'template_card_event') return;
+    const chattype = body.chattype ?? (body.chatid ? 'group' : 'single');
+    if (!['single', 'group'].includes(chattype) || (chattype === 'group' && !body.chatid)) return;
+    const normalized = { ...frame, body: { ...body, chattype } };
+    const chatId = chattype === 'group' ? body.chatid : senderId;
+    const access = evaluateInboundAccess(this.#accessPolicy, {
+      conversationType: chattype === 'single' ? 'direct' : 'group', senderIds: senderId, isCommand: true,
+    });
+    if (!access.allowed) {
+      if (access.reason === 'command-not-allowed') {
+        await this.#sendActive(chatId, t(COMMAND_PERMISSION_DENIED_MESSAGE));
+      }
+      return;
+    }
+    await this.#state.markSeen(body.msgid);
+    const key = conversationKey(normalized);
+    // Live callbacks nest these fields; older SDK examples show them flat.
+    const callback = body.event.template_card_event ?? body.event;
+    const entry = this.#menus.get(callback.task_id);
+    const choice = typeof callback.event_key === 'string' && /^\d+$/u.test(callback.event_key)
+      ? entry?.menu.entries[callback.event_key] : null;
+    if (!entry || entry.expiresAt <= Date.now() || !Array.isArray(choice)
+      || entry.key !== key) {
+      await this.#sendActive(chatId, t('这个菜单已过期，请回复 /m 重新打开。'));
+      return;
+    }
+    this.#menus.delete(callback.task_id);
+    // Acknowledge before Host RPC. Keep a valid button card: text_notice requires a URL.
+    const acknowledgedMenu = { title: choice[0], description: t('已收到操作，请查看下方结果。'),
+      entries: [[t('重新打开菜单'), '/menu']] };
+    await this.#client.updateTemplateCard(frame, wecomTemplateCard(acknowledgedMenu, callback.task_id), [senderId]).then(() => {
+      this.#menus.set(callback.task_id, { ...entry, menu: acknowledgedMenu });
+    }).catch((error) => {
+      this.#logger.warn?.('[dsh-im:wecom] menu acknowledgement failed:', error);
+    });
+    let commands = [choice[1]];
+    if (choice[1] === 'apply' || choice[1].startsWith('select:')) {
+      const selectors = (entry.menu.selectors ?? []).filter((item) => choice[1] === 'apply' || item.key === choice[1].slice(7));
+      const selectedItems = callback.selected_items?.selected_item ?? callback.selected_items ?? [];
+      if (!Array.isArray(selectedItems)) {
+        await this.#sendActive(chatId, t('请选择一个选项后再应用。'));
+        return;
+      }
+      commands = [];
+      for (const selector of selectors) {
+        const selected = selectedItems.find((item) => item?.question_key === selector.key);
+        const ids = selected?.option_ids?.option_id ?? selected?.option_ids ?? ['0'];
+        const id = ids[0];
+        if (!Array.isArray(ids) || ids.length !== 1 || !/^\d+$/u.test(id) || !selector.entries[Number(id)]) {
+          await this.#sendActive(chatId, t('请选择一个选项后再应用。'));
+          return;
+        }
+        const command = selector.entries[Number(id)][1];
+        if (command) commands.push(command);
+      }
+    }
+    const navigation = commands.find((command) => parseWecomMenu(command));
+    if (navigation) commands = [navigation];
+    if (!navigation && entry.workspace !== this.#harness.currentWorkspace?.()) {
+      await this.#sendActive(chatId, t('工作区已变化，请发送 /m 重新打开菜单后选择。'));
+    } else {
+      for (const [index, command] of commands.entries()) {
+        const commandFrame = { ...normalized, body: { ...normalized.body,
+          msgid: `card:${body.msgid}:${index}`, msgtype: 'text', text: { content: command },
+        } };
+        this.#cardFrames.add(commandFrame);
+        await this.accept(commandFrame);
+      }
+      if (!commands.length) await this.#sendActive(chatId, t('设置未改变。'));
+    }
+  }
+
+  async #runMenuCommand(frame, text, _harness, _state, key) {
+    const menu = parseWecomMenu(text);
+    const options = { signal: this.#signal };
+    if (menu) {
+      const previousFailure = this.#status.lastMessageError;
+      let content;
+      if (menu.section === 'main') {
+        await this.#showMain(frame);
+        return { messages: [] };
+      }
+      else {
+        let title;
+        let entries;
+        let description = '';
+        if (menu.section === 'sessions') {
+          title = t('📋 会话列表');
+          const listed = await this.#harness.listWorkspaceSessions(this.#harness.currentWorkspace(), options);
+          entries = listed.sessions.map((session) => [
+            `${session.sessionId === this.#state.sessionFor(key) ? '✓ ' : ''}${session.title || t('暂无标题')}`,
+            `/session ${session.sessionId}`,
+          ]);
+        } else if (menu.section === 'workspaces') {
+          title = t('🗂 工作区列表');
+          const { paths, current } = await workspacePathSnapshot(this.#harness, options);
+          entries = paths.map((path) => [`${path === current ? '✓ ' : ''}${path}`, `/workspace ${path}`]);
+        } else if (menu.section === 'models') {
+          title = t('🧠 切换模型');
+          const sessionId = this.#state.sessionFor(key);
+          const session = sessionId ? this.#harness.workspaceSession?.(sessionId, key) : null;
+          const catalog = typeof session?.models === 'function'
+            ? await session.models(options) : await this.#harness.listModels(options);
+          entries = catalog.groups.flatMap((group) => group.models.map((model) => [
+            `${catalog.current?.provider === group.id && catalog.current?.model === model.id ? '✓ ' : ''}${model.name} (${group.id})`,
+            `/model ${group.id}/${model.id}`,
+          ]));
+          if (catalog.failures?.length) description = t('部分模型暂不可用，可稍后重试。');
+        } else {
+          title = t('🤖 切换预设');
+          const settings = await this.#harness.agentPresetSettings(options);
+          entries = [[t('🔄 跟随默认'), '/preset --default'], ...settings.agentPresetCatalog.items.map((item) => [
+            `${settings.agentPreset === item.id ? '✓ ' : ''}${item.label || item.id}`,
+            `/preset ${/^\d+$/u.test(item.id) ? 'id:' : ''}${item.id}`,
+          ])];
+          description = t('预设仅用于之后的新会话。');
+        }
+        this.#harness.assertWorkspaceScope?.();
+        content = wecomList({ title, entries, description, ...menu });
+      }
+      await this.#sendMenu(frame, content);
+      this.#clearMenuFailure(previousFailure);
+      return { messages: [] };
+    }
+    const command = text.toLowerCase();
+    if (command === '/help') return { message: helpText() };
+    if (command === '/status') {
+      await this.#harness.ensureRunning(options);
+      return { message: t('企业微信机器人与 DeepSeek Harness 连接正常。') };
+    }
+    if (this.#queues.has(key) || this.#pendingInteractions.has(key) || this.#approvals.hasPending(key)
+      || this.#batchInputs.status(key).phase !== 'idle') {
+      return { message: t('当前任务仍在运行，请先停止任务或等待任务完成后再开启新会话。') };
+    }
+    if (command === '/new') {
+      await this.#state.clearSession(key);
+      return { message: t('已开启新会话。请发送你的问题。') };
+    }
+    return await runWorkspaceCommand(text, this.#harness, key)
+      ?? await runCompactCommand(text, this.#harness, this.#state, key, options);
   }
 
   accept(frame) {
@@ -557,16 +880,30 @@ export class WecomHarnessBridge {
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
 
     const key = conversationKey(frame);
+    const pending = this.#pendingInteractions.get(key);
+    const commandMessage = wecomInboundMessage(frame, this.#client);
+    const commandText = nonEmptyString(commandMessage.content) ?? '';
+    const conversationType = body.chattype === 'single' ? 'direct' : 'group';
+    const access = evaluateInboundAccess(this.#accessPolicy, {
+      conversationType,
+      senderIds: senderId,
+      text: commandText,
+      hasImages: hasInboundImages(commandMessage),
+      hasFiles: hasInboundFiles(commandMessage),
+      ...(parseWecomMenu(commandText) && !hasInboundImages(commandMessage) && !hasInboundFiles(commandMessage)
+        ? { isCommand: true } : {}),
+    });
+    if (!access.allowed) {
+      this.#acceptedMessageIds.set(messageId, null);
+      return this.#finishAccessDecision(frame, messageId, chatId, access);
+    }
     this.#acceptedMessageIds.set(messageId, captureContextEnhancement(
       this.#contextEnhancement,
-      body.chattype === 'single' ? 'direct' : 'group',
+      conversationType,
     ));
     if (body.chattype === 'single') {
       rememberConnectionTestTarget(this.#state, { chatId });
     }
-    const pending = this.#pendingInteractions.get(key);
-    const commandMessage = wecomInboundMessage(frame, this.#client);
-    const commandText = nonEmptyString(commandMessage.content) ?? '';
     const batchCommand = isBatchInputCommand(commandText);
     const batchStatus = this.#batchInputs.status(key);
     if (batchCommand && body.chattype === 'group') {
@@ -585,7 +922,7 @@ export class WecomHarnessBridge {
         && (this.#queues.has(key) || pending || this.#approvals.hasPending(key))
         ? { handled: true, kind: 'busy', message: batchInputBusyMessage() }
         : this.#batchInputs.handle(key, commandText, {
-            plainText: isNativeWecomText(frame),
+            plainText: isNativeWecomText(frame) && !hasReplyReference(commandMessage),
           });
       if (result.handled) {
         if (result.kind === 'submit') {
@@ -595,18 +932,25 @@ export class WecomHarnessBridge {
               ...body,
               msgtype: 'text',
               text: { content: result.prompt },
+              // The submission is exactly the collected text, so a quote on the
+              // command itself must not become part of it.
+              quote: undefined,
             },
           }, messageId, key, { batchSubmission: result });
         }
         return this.#finishBatchResult(frame, messageId, chatId, result);
       }
     }
+    const menuCommand = !hasInboundImages(commandMessage) && !hasInboundFiles(commandMessage)
+      && (parseWecomMenu(commandText) || ['/help', '/status', '/new'].includes(commandText.toLowerCase())
+        || this.#cardFrames.has(frame));
     const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
       : hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
           ? runModelCommand
-          : (isPresetCommand(commandText) ? runPresetCommand : null));
+          : (isPresetCommand(commandText) ? runPresetCommand : menuCommand
+            ? (...args) => this.#runMenuCommand(frame, ...args) : null));
     if (commandRunner) {
       let task;
       task = this.#processFastCommand(
@@ -619,10 +963,15 @@ export class WecomHarnessBridge {
       ).catch((error) => {
         if (error?.code === 'turn-stopped' || this.#signal?.aborted) return;
         this.#status.lastError = error?.message ?? String(error);
-        const failure = setLastMessageFailure(this.#status, error);
+        const failure = setLastMessageFailure(this.#status, error, {
+          reason: parseWecomMenu(commandText) && error?.wecomOperation ? 'wecom-menu-delivery' : undefined,
+        });
         this.#logger.error?.(
           `[dsh-im:wecom] failed to process a command [${failure.referenceId}]`,
+          wecomSendDiagnostic(error),
         );
+        if (this.#cardFrames.has(frame) && error?.wecomOperation
+          && error.code !== 'channel-delivery-failed') return;
         return this.#sendImmediate(frame, chatId, messageFailureText(failure))
           .catch(() => undefined);
       }).finally(() => {
@@ -760,6 +1109,39 @@ export class WecomHarnessBridge {
     return task;
   }
 
+  #finishAccessDecision(frame, messageId, chatId, access) {
+    let task;
+    task = Promise.resolve().then(async () => {
+      if (this.#state.hasSeen(messageId)) return;
+      await this.#state.markSeen(messageId);
+      if (access.reason === 'command-not-allowed') {
+        this.#status.messagesReceived += 1;
+        this.#status.lastMessageAt = new Date().toISOString();
+        await this.#sendImmediate(frame, chatId, t(COMMAND_PERMISSION_DENIED_MESSAGE));
+        this.#status.messagesReplied += 1;
+        this.#status.lastReplyAt = new Date().toISOString();
+      } else {
+        this.#status.messagesRejected += 1;
+        this.#status.lastRejectedAt = new Date().toISOString();
+      }
+      this.#status.lastError = null;
+    }).catch((error) => {
+      if (this.#signal?.aborted) return;
+      this.#status.lastError = error?.message ?? String(error);
+      this.#logger.error?.('[dsh-im:wecom] failed to apply inbound access policy', error);
+    }).finally(() => {
+      this.#acceptedMessageIds.delete(messageId);
+      this.#commandTasks.delete(task);
+    });
+    this.#commandTasks.add(task);
+    return task;
+  }
+
+  async #deliverDeferredOutcome(entry, outcome) {
+    await this.#sendActive(entry.target.chatId, deferredOutcomeText(outcome));
+    return true;
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -769,11 +1151,13 @@ export class WecomHarnessBridge {
       ...this.#approvalTasks,
       ...this.#commandTasks,
     ]);
+    await this.#deferred.whenIdle();
   }
 
   async #processFastCommand(frame, messageId, chatId, key, message, runner) {
     this.#signal?.throwIfAborted();
     if (this.#state.hasSeen(messageId)) return;
+    const previousFailure = this.#status.lastMessageError;
     await this.#state.markSeen(messageId);
     this.#status.messagesReceived += 1;
     this.#status.lastMessageAt = new Date().toISOString();
@@ -785,6 +1169,12 @@ export class WecomHarnessBridge {
       pendingInteraction: this.#pendingInteractions.has(key)
         || this.#approvals.hasPending(key),
       control: { owner: this, key },
+      deferredDelivery: this.#deferred,
+      enhancement: captureContextEnhancementSource(
+        this.#contextEnhancement,
+        bodyOf(frame).chattype === 'single' ? 'direct' : 'group',
+        () => ({ channel: 'wecom', senderId: bodyOf(frame).from?.userid, chatId }),
+      ),
     });
     if (result?.stopped) {
       await Promise.allSettled([
@@ -795,17 +1185,24 @@ export class WecomHarnessBridge {
     for (const reply of result?.messages ?? [result?.message]) {
       if (reply) await this.#sendImmediate(frame, chatId, reply);
     }
-    this.#status.lastError = null;
+    if (!this.#status.lastMessageError || this.#status.lastMessageError === previousFailure) {
+      this.#status.lastError = null;
+    }
   }
 
   async #sendActive(chatId, text) {
     const providerMessageIds = [];
     for (const chunk of splitUtf8(text)) {
       this.#signal?.throwIfAborted();
-      const result = await this.#client.sendMessage(
-        chatId,
-        { msgtype: 'markdown', markdown: { content: chunk } },
-      );
+      let result;
+      try {
+        result = await this.#client.sendMessage(
+          chatId,
+          { msgtype: 'markdown', markdown: { content: chunk } },
+        );
+      } catch (error) {
+        throw wecomSendError(error, 'sendMessage');
+      }
       const messageId = providerMessageId(result);
       if (messageId) providerMessageIds.push(messageId);
     }
@@ -814,6 +1211,7 @@ export class WecomHarnessBridge {
 
   async #sendImmediate(frame, chatId, text) {
     this.#signal?.throwIfAborted();
+    if (this.#cardFrames.has(frame)) return this.#sendActive(chatId, text);
     const chunks = splitUtf8(text);
     if (chunks.length === 0) return;
     try {
@@ -887,6 +1285,7 @@ export class WecomHarnessBridge {
     const text = message.content;
     const hasImages = hasInboundImages(message);
     const hasFiles = hasInboundFiles(message);
+    const hasReply = hasReplyReference(message);
     const key = conversationKey(frame);
     let streamId = null;
     let streamStarted = false;
@@ -895,7 +1294,7 @@ export class WecomHarnessBridge {
     let batchSettled = batchSubmission === null;
     let promptRecorded = false;
     try {
-      if (!text && !hasImages && !hasFiles) {
+      if (!text && !hasImages && !hasFiles && !hasReply) {
         await this.#sendImmediate(frame, chatId, t('目前支持文字、图片、文件和语音转写消息。'));
         await this.#state.markSeen(messageId);
         return;
@@ -956,24 +1355,32 @@ export class WecomHarnessBridge {
         this.#logger.warn?.('[dsh-im:wecom] unable to start a stream; using an active reply:', error);
       }
 
-      let content = hasImages
-        ? await promptContentForMessage(message, { signal: this.#signal })
+      let content = hasImages || hasReply
+        ? await promptContentForInboundMessage(message, { signal: this.#signal })
         : undefined;
       const snapshot = this.#acceptedMessageIds.get(messageId);
+      let contextEnhanced = false;
       if (snapshot) {
-        content = enhanceContextContent(content ?? text, snapshot, () => ({
+        const originalContent = content ?? text;
+        content = enhanceContextContent(originalContent, snapshot, () => ({
           channel: 'wecom',
           senderId,
+          chatId,
         }));
+        contextEnhanced = content !== originalContent;
       }
       await this.#state.markSeen(messageId);
       promptRecorded = true;
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        deferredDelivery: () => ({ coordinator: this.#deferred, target: { chatId } }),
         harness: this.#harness,
         state: this.#state,
         key,
         text,
         content,
+        titleText: batchSubmission?.title,
+        sourceGuidance: snapshot?.config?.guidance,
+        contextEnhanced,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: {
@@ -1050,7 +1457,7 @@ export class WecomHarnessBridge {
           });
         }
       } catch (error) {
-        textSendError = channelDeliveryFailure(error);
+        textSendError = wecomSendError(error, 'sendMessage');
         this.#logger.warn?.(
           '[dsh-im:wecom] final text delivery failed; continuing with result files:',
           error,
@@ -1107,6 +1514,7 @@ export class WecomHarnessBridge {
       });
       this.#logger.error?.(
         `[dsh-im:wecom] failed to process an inbound message [${failure.referenceId}]`,
+        wecomSendDiagnostic(error),
       );
       const errorText = messageFailureText(failure);
       const visibleError = batchFailureMessage

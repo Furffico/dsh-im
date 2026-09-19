@@ -1,3 +1,4 @@
+import { normalizeBotAlias } from '../../../../src/channels/shared/bot-alias.mjs';
 /**
  * Browser-safe contract for the Feishu Host plugin.
  *
@@ -7,8 +8,11 @@
  */
 
 import { normalizeAgentPresetCatalog, normalizeAgentPresetId } from "../../agent-preset.js";
+import { normalizeModelCatalog, normalizeModelSelection, SET_MODEL_ENDPOINT } from "../../model-setting.js";
 import { normalizeLastMessageError } from "../../last-message-error.js";
+import { normalizeAccessPolicy } from "../../../../src/channels/shared/access-policy.mjs";
 import { normalizeContextEnhancementConfig } from "../../../../src/channels/shared/context-enhancement.mjs";
+import { normalizeFeishuStepPushMode } from "../../../../src/channels/feishu/step-push-mode.mjs";
 
 export const FEISHU_RPC_CHANNEL = "/feishu";
 
@@ -24,9 +28,15 @@ export const FEISHU_ENDPOINTS = Object.freeze({
   disconnectBot: "bot.disconnect",
   deleteBot: "bot.delete",
   setWorkspace: "bot.workspace.set",
+  setModel: SET_MODEL_ENDPOINT,
   setAgentPreset: "bot.preset.set",
   setContextEnhancement: "bot.context-enhancement.set",
+  setAccessPolicy: "bot.access-policy.set",
+  setAlias: 'bot.alias.set',
   setGroupResponseMode: "bot.group-response-mode.set",
+  setGroupTopicReply: "bot.group-topic-reply.set",
+  setStepPush: "bot.step-push.set",
+  setStepPushMode: "bot.step-push-mode.set",
   // Kept for rolling upgrades. The multi-bot UI never calls these endpoints.
   testConnection: "connection.test",
   disconnect: "connection.disconnect",
@@ -149,6 +159,7 @@ export function normalizeProvisioning(value, now = Date.now()) {
 function normalizeBot(value) {
   const source = isRecord(value) ? value : {};
   return {
+    ...normalizeBotAlias(source),
     name: optionalString(source.name) ?? "飞书机器人",
     avatarUrl: optionalString(source.avatarUrl),
     appIdMasked: optionalString(source.appIdMasked),
@@ -204,9 +215,16 @@ export function normalizeBotConnection(value, fallbackBotId) {
     connected,
     configured: value.configured !== false,
     workspace: optionalString(value.workspace)?.slice(0, 4_096) ?? "",
+    model: normalizeModelSelection(value.model),
     agentPreset: normalizeAgentPresetId(value.agentPreset),
     contextEnhancement: normalizeContextEnhancementConfig(value.contextEnhancement),
+    ...(Object.hasOwn(value, "accessPolicy")
+      ? { accessPolicy: normalizeAccessPolicy(value.accessPolicy) }
+      : {}),
     groupResponseMode: normalizeGroupResponseMode(value.groupResponseMode),
+    groupTopicReply: value.groupTopicReply === true,
+    stepPush: value.stepPush === true,
+    stepPushMode: normalizeFeishuStepPushMode(value.stepPushMode),
     groupMessagePermissionGranted: value.groupMessagePermissionGranted === true,
     bot: normalizeBot(value.bot),
     health: normalizeHealth(value.health, connected),
@@ -265,6 +283,7 @@ export function normalizeBotsSnapshot(value) {
       : undefined,
     error: normalizeError(value.error),
     agentPresetCatalog: normalizeAgentPresetCatalog(value.agentPresetCatalog),
+    modelCatalog: normalizeModelCatalog(value.modelCatalog),
   };
 }
 

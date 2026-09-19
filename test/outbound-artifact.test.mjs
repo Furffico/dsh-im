@@ -14,6 +14,7 @@ import {
   releaseOutboundArtifact,
   requestedPaths,
 } from '../src/channels/shared/semantic/artifact.mjs';
+import { symlinkOrSkip } from './support/filesystem.mjs';
 
 async function fixture(t) {
   const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-artifact-workspace-'));
@@ -74,6 +75,60 @@ test('requestedPaths keeps a string as one file and accepts a string array', () 
   );
 });
 
+test('file return reads modern Session event snapshots', async (t) => {
+  const fx = await fixture(t);
+  const events = fx.agent.session.events;
+  fx.agent.session = {
+    header: fx.agent.session.header,
+    snapshotEvents: () => Object.freeze(events),
+  };
+  await writeFile(join(fx.workspace, 'modern.txt'), 'modern session');
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  const result = await execute(tool, { path: 'modern.txt' }, execution(fx.agent, 'modern'));
+
+  assert.equal(result.artifactId, 'artifact-id-1');
+  assert.equal(result.fileName, 'modern.txt');
+  const { artifact, file } = await takeFile(fx.registry);
+  assert.equal(file.bytes.toString(), 'modern session');
+  releaseOutboundArtifact(artifact);
+});
+
+test('file return prefers snapshotEvents over a stale session.events array', async (t) => {
+  const fx = await fixture(t);
+  fx.agent.session.events = [];
+  fx.agent.session.snapshotEvents = () => Object.freeze([
+    { type: 'turn/start', data: { turn: 7 } },
+  ]);
+  await writeFile(join(fx.workspace, 'prefer.txt'), 'prefer snapshot');
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  const result = await execute(tool, { path: 'prefer.txt' }, execution(fx.agent, 'prefer'));
+
+  assert.equal(result.fileName, 'prefer.txt');
+  const { artifact, file } = await takeFile(fx.registry);
+  assert.equal(file.bytes.toString(), 'prefer snapshot');
+  releaseOutboundArtifact(artifact);
+});
+
+test('file return still requires a live Session turn on modern snapshots', async (t) => {
+  const fx = await fixture(t);
+  fx.agent.session = {
+    header: fx.agent.session.header,
+    snapshotEvents: () => Object.freeze([
+      { type: 'turn/start', data: { turn: 7 } },
+      { type: 'turn/end', data: { turn: 7 } },
+    ]),
+  };
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  await assert.rejects(
+    tool.definition.execute({ path: 'ended.txt' }, execution(fx.agent, 'ended')),
+    (error) => error.code === 'artifact-context-required'
+      && error.message === 'A live Harness Session is required to return a file.',
+  );
+});
+
 test('an existing file can be sent directly without recreation', async (t) => {
   const fx = await fixture(t);
   await writeFile(join(fx.workspace, 'existing.txt'), 'already here');
@@ -96,7 +151,7 @@ test('absolute outside-workspace paths and symbolic links are delivered normally
   const fx = await fixture(t);
   const outsidePath = join(fx.outside, 'outside.txt');
   await writeFile(outsidePath, 'outside content');
-  await symlink(outsidePath, join(fx.workspace, 'linked.txt'));
+  if (!await symlinkOrSkip(t, outsidePath, join(fx.workspace, 'linked.txt'))) return;
   const tool = createOutboundArtifactTool({ registry: fx.registry });
 
   await execute(tool, { path: outsidePath }, execution(fx.agent, 'outside'));
@@ -446,12 +501,56 @@ test('Host installer always exposes the tool and explicitly permits existing fil
   assert.match(definition.description, /Existing and newly created files are both valid/);
   assert.match(definition.description, /one string or an array of strings/);
   assert.equal(definition.parameters.properties.path.oneOf.length, 2);
+  assert.match(definition.description, /Success means queued, not sent/);
+  assert.match(definition.output.render({}, { fileName: 'result.zip', size: 123 })[0].text, /has not been sent yet/);
   assert.match(section.text, /Existing files can be sent directly/);
   assert.match(section.text, /array of strings/);
+  assert.match(section.text, /after your turn finishes/);
   assert.equal(typeof listeners.get('tools/result'), 'function');
   assert.equal(typeof listeners.get('session/event'), 'function');
   assert.equal(typeof listeners.get('session/disposed'), 'function');
   assert.equal(listeners.has('agent/inbox/claimed'), false);
   assert.equal(listeners.has('system-prompt/assemble'), false);
   assert.equal(installOutboundArtifactTool({}), false);
+});
+
+test('file return stages with the turn observed from the live session event stream', async (t) => {
+  const fx = await fixture(t);
+  fx.agent.session = { header: fx.agent.session.header };
+  await writeFile(join(fx.workspace, 'stream.txt'), 'stream turn');
+  fx.registry.observeSessionEvent(fx.agent.session, { type: 'turn/start', data: { turn: 7 } });
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  const result = await execute(tool, { path: 'stream.txt' }, execution(fx.agent, 'stream'));
+
+  assert.equal(result.fileName, 'stream.txt');
+  const { artifact, file } = await takeFile(fx.registry);
+  assert.equal(file.bytes.toString(), 'stream turn');
+  releaseOutboundArtifact(artifact);
+});
+
+test('file return rejects once the observed turn has closed without any session event snapshot', async (t) => {
+  const fx = await fixture(t);
+  fx.agent.session = { header: fx.agent.session.header };
+  fx.registry.observeSessionEvent(fx.agent.session, { type: 'turn/start', data: { turn: 7 } });
+  fx.registry.observeSessionEvent(fx.agent.session, { type: 'turn/end', data: { turn: 7 } });
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  await assert.rejects(
+    tool.definition.execute({ path: 'closed.txt' }, execution(fx.agent, 'closed')),
+    (error) => error.code === 'artifact-context-required'
+      && error.message === 'A live Harness Session is required to return a file.',
+  );
+});
+
+test('file return rejects a bare session without snapshot or observed turn activity', async (t) => {
+  const fx = await fixture(t);
+  fx.agent.session = { header: fx.agent.session.header };
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+
+  await assert.rejects(
+    tool.definition.execute({ path: 'bare.txt' }, execution(fx.agent, 'bare')),
+    (error) => error.code === 'artifact-context-required'
+      && error.message === 'A live Harness Session is required to return a file.',
+  );
 });

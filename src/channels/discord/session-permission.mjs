@@ -1,4 +1,12 @@
+import { getImHostLanguage } from '../shared/i18n.mjs';
+import { SESSION_CHANNEL_LABELS } from '../shared/session-channel-labels.mjs';
 import { discordSessionTitle } from './session-title.mjs';
+
+/** The localized Discord label, so the title carries the active language. */
+function discordTitlePrefix(language = getImHostLanguage()) {
+  const labels = SESSION_CHANNEL_LABELS.discord;
+  return labels?.[language === 'en' ? 1 : 0] ?? 'Discord';
+}
 
 export const DISCORD_SESSION_PERMISSIONS = Object.freeze({
   WORKSPACE_WRITE: 'workspace-write',
@@ -69,7 +77,11 @@ export function wrapDiscordSessionPermission(harness, getDefaultPermission, { no
           try {
             await target.renameSession(
               sessionId,
-              discordSessionTitle({ channelLabel: label, now: clock() }),
+              discordSessionTitle({
+                channelLabel: label,
+                prefix: discordTitlePrefix(),
+                now: clock(),
+              }),
               createOptions,
             );
           } catch {

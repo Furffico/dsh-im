@@ -1,5 +1,17 @@
+import { randomUUID } from 'node:crypto';
+
+import { createDeferredDeliveryCoordinator, deferredOutcomeText } from './deferred-delivery-coordinator.mjs';
 import { t } from './i18n.mjs';
-import { captureContextEnhancement, enhanceContextContent } from './context-enhancement.mjs';
+import { commandHelpLines } from './command-catalog.mjs';
+import {
+  COMMAND_PERMISSION_DENIED_MESSAGE,
+  evaluateInboundAccess,
+} from './inbound-access.mjs';
+import {
+  captureContextEnhancement,
+  captureContextEnhancementSource,
+  enhanceContextContent,
+} from './context-enhancement.mjs';
 import { runWorkspaceCommand } from './workspace-command.mjs';
 import { runCompactCommand } from './compact-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from './history-command.mjs';
@@ -31,7 +43,6 @@ import {
   hasInboundImages,
   imagePromptDiagnostic,
   imagePromptUserMessage,
-  promptContentForMessage,
 } from './image-prompt.mjs';
 import {
   hasInboundFiles,
@@ -43,6 +54,10 @@ import {
   validHarnessQuestion,
 } from './harness-question.mjs';
 import { deliverOutboundArtifacts } from './semantic/artifact-delivery.mjs';
+import {
+  hasReplyReference,
+  promptContentForInboundMessage,
+} from './semantic/reply-reference.mjs';
 import {
   createDeliveryReceipt,
   createTextDeliveryBlock,
@@ -59,6 +74,15 @@ import { beginStatusReaction } from './status-reaction.mjs';
 const INTERACTION_RESOLVED_TEXT = '这个问题已在其他客户端处理，无需再次回答。';
 const FILE_ONLY_COMPLETION_TEXT = '任务已完成。';
 
+/**
+ * How many times one inbound message may be re-delivered after a failed turn.
+ *
+ * A failure releases the message's `markSeen` so the next poll retries it, which
+ * would otherwise loop forever on a mail that always fails. After this many
+ * attempts the mark stays and the message is treated as handled.
+ */
+const MAX_DELIVERY_ATTEMPTS = 3;
+
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -68,7 +92,7 @@ function canClaimInteractionReply(message, pending, senderId) {
     && (message.kind !== 'group' || message.addressed === true)
     && !hasInboundImages(message)
     && !hasInboundFiles(message)
-    && Boolean(cleanText(message.content));
+    && Boolean(controlTextOf(message));
 }
 
 function artifactFailureText(fileName, error, descriptor) {
@@ -123,16 +147,31 @@ export function createTextBridgeStatus() {
   };
 }
 
+/**
+ * The text a channel's control commands and approval decisions are parsed from.
+ *
+ * A channel may decorate `content` for the model — the email channel prepends
+ * the mail headers so a subject line reaches the model — while `controlText`
+ * keeps the undecorated body. Without this a decorated message made `/help`
+ * and "批准" unrecognisable.
+ */
+function controlTextOf(message) {
+  return cleanText(message?.controlText ?? message?.content);
+}
+
 export class TextHarnessBridge {
   #descriptor;
   #bot;
   #harness;
   #state;
+  #deferred;
   #contextEnhancement;
+  #accessPolicy;
   #status;
   #logger;
   #replyTimeoutMs;
   #signal;
+  #keepaliveIntervalMs;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -143,6 +182,11 @@ export class TextHarnessBridge {
   #approvals;
   #batches = new BatchInputManager();
   #sessionCreateOptions;
+  #interactionCard;
+  // Delivery attempts per message id. A failed turn releases its `markSeen` so
+  // the next poll can retry, and this counter is what keeps that from becoming
+  // an infinite loop on a mail that always fails.
+  #deliveryAttempts = new Map();
 
   constructor({
     descriptor,
@@ -150,11 +194,14 @@ export class TextHarnessBridge {
     harness,
     state,
     contextEnhancement,
+    accessPolicy,
     status = createTextBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
     signal,
     sessionCreateOptions,
+    keepaliveIntervalMs = 4_000,
+    interactionCard = null,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -164,6 +211,7 @@ export class TextHarnessBridge {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -171,6 +219,11 @@ export class TextHarnessBridge {
     this.#sessionCreateOptions = typeof sessionCreateOptions === 'function'
       ? sessionCreateOptions
       : null;
+    this.#keepaliveIntervalMs = keepaliveIntervalMs;
+    this.#interactionCard = interactionCard ?? null;
+    this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
+      deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
+    });
     this.#approvals = new HarnessApprovalQueue({
       label: descriptor.key,
       logger,
@@ -190,7 +243,7 @@ export class TextHarnessBridge {
     return structuredClone(this.#status);
   }
 
-  accept(message, { contextSnapshot } = {}) {
+  accept(message, { contextSnapshot, accessDecision } = {}) {
     if (this.#signal?.aborted) return Promise.resolve();
     const conversationId = cleanText(message?.conversationId);
     const kind = message?.kind === 'group' ? 'group' : 'direct';
@@ -200,6 +253,44 @@ export class TextHarnessBridge {
     if (!messageId || !senderId || !conversationId || normalized.senderIsBot === true
       || this.#state.hasSeen(messageId) || this.#acceptedMessageIds.has(messageId)) {
       return Promise.resolve();
+    }
+    // Preserve the channel trigger boundary. Access policy never turns an
+    // unaddressed group message into a denial reply.
+    if (kind === 'group' && normalized.addressed !== true) {
+      this.#status.messagesRejected += 1;
+      this.#status.lastRejectedAt = new Date().toISOString();
+      this.#acceptedMessageIds.set(messageId, null);
+      return this.#finishLocalMessage(normalized, messageId, null);
+    }
+    if (this.#accessPolicy || accessDecision) {
+      const hasImages = hasInboundImages(normalized);
+      const hasFiles = hasInboundFiles(normalized);
+      const decision = accessDecision ?? evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: kind,
+        senderIds: [senderId, cleanText(normalized.senderAlternateId)].filter(Boolean),
+        // The same control text the command runner below parses. A channel may
+        // decorate `content` for the model (email prepends the mail headers), and
+        // a decorated body never looks like a command — so reading `content` here
+        // recognized no command at all and skipped the command-permission gate.
+        text: controlTextOf(normalized),
+        hasImages,
+        hasFiles,
+      });
+      if (!decision.allowed) {
+        this.#status.messagesRejected += 1;
+        this.#status.lastRejectedAt = new Date().toISOString();
+        // Mark policy denials so a webhook replay cannot repeat local work or
+        // a command-permission notice.
+        this.#acceptedMessageIds.set(messageId, null);
+        return this.#finishLocalMessage(
+          normalized,
+          messageId,
+          decision.reason === 'command-not-allowed'
+            ? t(COMMAND_PERMISSION_DENIED_MESSAGE)
+            : null,
+          { recordReceived: decision.reason === 'command-not-allowed' },
+        );
+      }
     }
     this.#acceptedMessageIds.set(messageId, contextSnapshot === undefined
       ? captureContextEnhancement(this.#contextEnhancement, message?.kind)
@@ -234,7 +325,7 @@ export class TextHarnessBridge {
 
     const key = `${normalized.kind}:${normalized.conversationId}`;
     const pending = this.#pendingInteractions.get(key);
-    const text = cleanText(normalized.content);
+    const text = controlTextOf(normalized);
     const batchCommand = isBatchInputCommand(text);
     if (batchCommand && normalized.kind === 'group' && normalized.addressed === true) {
       return this.#finishLocalMessage(
@@ -256,14 +347,20 @@ export class TextHarnessBridge {
         plainText: Boolean(text)
           && normalized.plainText !== false
           && !hasInboundImages(normalized)
-          && !hasInboundFiles(normalized),
+          && !hasInboundFiles(normalized)
+          && !hasReplyReference(normalized),
       });
       if (batch.handled) {
         if (batch.kind === 'submit') {
           return this.#enqueueMessage({
             ...normalized,
             content: batch.prompt,
-            batchSubmission: { token: batch.token },
+            // The submission is exactly the collected text; a quote or an
+            // attachment on the command itself is not part of it.
+            replyTo: null,
+            images: [],
+            files: [],
+            batchSubmission: { token: batch.token, title: batch.title },
           }, messageId, senderId, key);
         }
         return this.#finishLocalMessage(normalized, messageId, batch.message);
@@ -274,7 +371,8 @@ export class TextHarnessBridge {
         plainText: Boolean(text)
           && normalized.plainText !== false
           && !hasInboundImages(normalized)
-          && !hasInboundFiles(normalized),
+          && !hasInboundFiles(normalized)
+          && !hasReplyReference(normalized),
       });
       if (batch.handled) {
         return this.#finishLocalMessage(normalized, messageId, batch.message);
@@ -295,6 +393,7 @@ export class TextHarnessBridge {
         messageId,
         key,
         commandRunner,
+        senderId,
       ).finally(() => {
         this.#acceptedMessageIds.delete(messageId);
         this.#commandTasks.delete(task);
@@ -306,7 +405,12 @@ export class TextHarnessBridge {
       key,
       actor: senderId,
       messageId,
-      text: hasInboundImages(normalized) || hasInboundFiles(normalized) ? '' : normalized.content,
+      // Approval decisions are parsed from the control text, exactly like the
+      // commands above: a decorated `content` hid "批准" behind the mail headers,
+      // so a plain-body approval never claimed its pending request.
+      text: hasInboundImages(normalized) || hasInboundFiles(normalized)
+        ? ''
+        : controlTextOf(normalized),
       addressed: normalized.kind !== 'group' || normalized.addressed === true,
       hasPendingQuestion: Boolean(pending),
       questionCompletion: pending?.submitting || pending?.claimedReplyMessageId
@@ -364,13 +468,15 @@ export class TextHarnessBridge {
     return this.#enqueueMessage(normalized, messageId, senderId, key);
   }
 
-  #finishLocalMessage(message, messageId, reply) {
+  #finishLocalMessage(message, messageId, reply, { recordReceived = true } = {}) {
     let task;
     task = (async () => {
       if (this.#state.hasSeen(messageId)) return;
       await this.#state.markSeen(messageId);
-      this.#status.messagesReceived += 1;
-      this.#status.lastMessageAt = new Date().toISOString();
+      if (recordReceived) {
+        this.#status.messagesReceived += 1;
+        this.#status.lastMessageAt = new Date().toISOString();
+      }
       if (reply) await this.#bot.sendText(message.replyTarget, reply);
       this.#status.lastError = null;
     })().catch(async (error) => {
@@ -415,6 +521,13 @@ export class TextHarnessBridge {
     return current;
   }
 
+  async #deliverDeferredOutcome(entry, outcome) {
+    const text = deferredOutcomeText(outcome);
+    return typeof this.#bot.sendDelivery === 'function'
+      ? this.#bot.sendDelivery(entry.target, createTextDeliveryBlock(text, outcome.found ? 'markdown' : 'plain'))
+      : this.#bot.sendText(entry.target, text);
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -424,9 +537,10 @@ export class TextHarnessBridge {
       ...this.#approvalTasks,
       ...this.#commandTasks,
     ]);
+    await this.#deferred.whenIdle();
   }
 
-  async #processFastCommand(message, messageId, key, runner) {
+  async #processFastCommand(message, messageId, key, runner, senderId) {
     if (this.#state.hasSeen(messageId)) return;
     await this.#state.markSeen(messageId);
     this.#status.messagesReceived += 1;
@@ -434,7 +548,7 @@ export class TextHarnessBridge {
     const target = message.replyTarget;
     try {
       const result = await runner(
-        cleanText(message.content),
+        controlTextOf(message),
         this.#harness,
         this.#state,
         key,
@@ -447,6 +561,22 @@ export class TextHarnessBridge {
             || this.#approvals.hasPending(key),
           control: { owner: this, key },
           sessionCreateOptions: this.#sessionCreateOptions?.(message),
+          deferredDelivery: this.#deferred,
+          enhancement: captureContextEnhancementSource(
+            this.#contextEnhancement,
+            message.kind,
+            () => {
+              const source = message.contextSource?.();
+              return {
+                channel: this.#descriptor.key,
+                senderId,
+                senderName: source?.senderName,
+                conversationTitle: source?.conversationTitle,
+                chatId: source?.chatId ?? message.conversationId,
+                threadId: source?.threadId,
+              };
+            },
+          ),
         },
       );
       if (result?.stopped) {
@@ -482,6 +612,11 @@ export class TextHarnessBridge {
       channelLabel: t('{label}机器人', { label: this.#descriptor.label }),
       send: (target, message) => this.#bot.sendText(target, message),
     });
+  }
+
+  sendProactiveText(target, text, { signal } = {}) {
+    signal?.throwIfAborted();
+    return this.#bot.sendText(target, text);
   }
 
   async #deliverArtifacts(target, replyTo, artifacts = [], baseReceipt) {
@@ -532,10 +667,19 @@ export class TextHarnessBridge {
     }
 
     const target = message.replyTarget;
-    const text = cleanText(message.content);
+    const text = controlTextOf(message);
     const batchSubmission = message.batchSubmission;
     let stream = null;
     let semanticStream = false;
+    // A keepalive heartbeat keeps short-lived carriers (e.g. Telegram's
+    // private-chat Rich Draft) visible during long silent stretches such as a
+    // running tool call. Declared outside the try so every exit path (including
+    // pre-prompt failures like image parsing) clears the timer.
+    let keepaliveTimer = null;
+    const stopKeepalive = () => {
+      if (keepaliveTimer !== null) clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    };
     try {
       this.#signal?.throwIfAborted();
       if (message.kind === 'group' && message.addressed !== true) {
@@ -545,7 +689,8 @@ export class TextHarnessBridge {
       }
       const hasImages = hasInboundImages(message);
       const hasFiles = hasInboundFiles(message);
-      if (!text && !hasImages && !hasFiles) {
+      const hasReply = hasReplyReference(message);
+      if (!text && !hasImages && !hasFiles && !hasReply) {
         await this.#bot.sendText(target, t('目前支持文字、图片和文件消息。'));
         return;
       }
@@ -555,30 +700,7 @@ export class TextHarnessBridge {
           t('{label}机器人已连接 DeepSeek Harness。', { label: this.#descriptor.label }),
           '',
           t('直接发送文字、图片或文件即可继续当前会话。'),
-          t('/new  开启一个全新会话'),
-          t('/compact  压缩当前会话的较早上下文'),
-          t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
-          t('/workspace 工作区绝对路径  切换工作区'),
-          t('/workspacelist  列出工作区绝对路径'),
-          t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
-          t('/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话'),
-          t('/models  按序号列出所有可用模型'),
-          t('/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级'),
-          t('/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级'),
-          t('/model [序号或完整模型ID] [推理等级ID]  查看或切换当前会话模型'),
-          t('示例：先发 /models，再发 /model 2 [推理等级ID]'),
-          t('/presetlist  按序号列出可用 Agent Preset'),
-          t('/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset'),
-          t('纯数字 ID：/preset id:<ID>'),
-          t('/preset --default  跟随 Host 默认'),
-          t('/stop  停止当前任务'),
-          t('/steer 补充指令  纠偏当前任务'),
-          t('/batch  开始批量输入（仅私聊，最多 10 条文字）'),
-          t('/send  提交当前批次'),
-          t('/cancel  取消当前批次'),
-          t('/status  检查连接状态'),
-          t('/version  查看插件版本'),
-          t('/help  显示本帮助'),
+          ...commandHelpLines(this.#descriptor.key),
         ].join('\n'));
         return;
       }
@@ -639,23 +761,57 @@ export class TextHarnessBridge {
           );
         }
       }
-      let content = hasImages
-        ? await promptContentForMessage(message, { signal: this.#signal })
+      let content = hasImages || hasReply
+        ? await promptContentForInboundMessage(message, { signal: this.#signal })
         : undefined;
       const snapshot = this.#acceptedMessageIds.get(messageId);
+      let contextEnhanced = false;
       if (snapshot) {
-        content = enhanceContextContent(content ?? text, snapshot, () => ({
+        const originalContent = content ?? text;
+        const contextSource = message.contextSource?.();
+        content = enhanceContextContent(originalContent, snapshot, () => ({
           channel: this.#descriptor.key,
           senderId,
-          senderName: message.contextSource?.()?.senderName,
+          senderName: contextSource?.senderName,
+          conversationTitle: contextSource?.conversationTitle,
+          chatId: contextSource?.chatId ?? message.conversationId,
+          threadId: contextSource?.threadId,
         }));
+        contextEnhanced = content !== originalContent;
+      }
+      // Start the keepalive only after the inbound payload is ready, so a
+      // pre-prompt failure (image parsing, context building) cannot leave the
+      // timer running; the outermost finally below clears it on every path.
+      if (stream && stream.keepalive === true && typeof stream.refresh === 'function') {
+        let refreshing = false;
+        keepaliveTimer = setInterval(async () => {
+          // Skip ticks while the previous heartbeat is pending so redundant
+          // refreshes cannot queue ahead of the final answer on a slow network.
+          if (refreshing) return;
+          refreshing = true;
+          try {
+            await Promise.allSettled([
+              this.#bot.sendTyping?.(target),
+              stream.refresh(),
+            ]);
+          } catch {
+            // Keepalive is best-effort, including synchronous adapter failures.
+          } finally {
+            refreshing = false;
+          }
+        }, this.#keepaliveIntervalMs);
+        keepaliveTimer.unref?.();
       }
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
         key: conversationKey,
         text,
         content,
+        titleText: batchSubmission?.title,
+        sourceGuidance: snapshot?.config?.guidance,
+        contextEnhanced,
         createOptions: this.#createSessionOptions(message),
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
@@ -672,16 +828,23 @@ export class TextHarnessBridge {
                 : progress);
             }
           } : undefined,
-          onInteraction: (interaction) => this.#handleInteraction(interaction, {
-            key: conversationKey,
-            actor: senderId,
-            target,
-            requiresMention: message.kind === 'group' && message.requiresMention !== false,
-          }),
+          onInteraction: async (interaction) => {
+            if (stream?.keepalive === true && typeof stream.stopPreview === 'function') {
+              stopKeepalive();
+              await stream.stopPreview();
+            }
+            return this.#handleInteraction(interaction, {
+              key: conversationKey,
+              actor: senderId,
+              target,
+              requiresMention: message.kind === 'group' && message.requiresMention !== false,
+            });
+          },
           onInteractionResolved: (resolution) => this.#handleInteractionResolved(resolution),
           files: message.files,
         },
       });
+      stopKeepalive();
       if (batchSubmission) {
         this.#batches.complete(conversationKey, batchSubmission.token);
       }
@@ -766,8 +929,11 @@ export class TextHarnessBridge {
           clearLastMessageFailure(this.#status);
         }
       }
+      // The turn produced an answer, so its retry budget is spent and reset.
+      this.#deliveryAttempts.delete(messageId);
       return delivery.receipt;
     } catch (error) {
+      stopKeepalive();
       const turnStopped = error?.code === 'turn-stopped';
       if (batchSubmission && turnStopped) {
         this.#batches.complete(conversationKey, batchSubmission.token);
@@ -836,8 +1002,13 @@ export class TextHarnessBridge {
           sendError,
         );
       }
+      // The turn produced no answer, so this id is "attempted", not "handled".
+      // Releasing the mark lets the next poll retry it; `alreadyRecorded` means
+      // an outer caller owns the mark, so it is left alone there.
+      if (!alreadyRecorded) await this.#releaseFailedDelivery(messageId);
       return error.deliveryReceipt;
     } finally {
+      stopKeepalive();
       await Promise.allSettled([
         this.#cancelPendingInteraction(conversationKey),
         this.#approvals.closeRoute(conversationKey),
@@ -845,7 +1016,59 @@ export class TextHarnessBridge {
     }
   }
 
-  async #processInteractionReply(message, messageId, senderId, key, expected) {
+  /**
+   * Release the `markSeen` of a turn that failed without delivering anything,
+   * so the next poll can pick the message up again.
+   *
+   * Bounded: a message is retried at most `MAX_DELIVERY_ATTEMPTS` times, after
+   * which the mark stays and the id becomes a tombstone. That keeps a mail that
+   * always fails from being re-executed forever, while a transient Harness
+   * outage no longer drops it permanently.
+   *
+   * Returns true when the message was released and will be retried.
+   */
+  async #releaseFailedDelivery(messageId) {
+    const attempts = (this.#deliveryAttempts.get(messageId) ?? 0) + 1;
+    if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+      // Give up: keep the mark so the id is never replayed, and stop tracking
+      // it. The sender has already been told the turn failed.
+      this.#deliveryAttempts.delete(messageId);
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] giving up on a message after `
+        + `${attempts} failed delivery attempts; it will not be retried.`,
+      );
+      return false;
+    }
+    this.#deliveryAttempts.set(messageId, attempts);
+    if (typeof this.#state?.unmarkSeen !== 'function') return false;
+    try {
+      await this.#state.unmarkSeen(messageId);
+      return true;
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] unable to release a failed message for retry:`,
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Advance the pending interaction with one answer.
+   *
+   * `resolveAnswer` lets a caller that already knows the exact answer supply it
+   * directly. A button press uses this: replaying its label as reply text would
+   * re-parse a numeric label such as "2" as the second option, submitting a
+   * different option than the one pressed.
+   */
+  async #processInteractionReply(
+    message,
+    messageId,
+    senderId,
+    key,
+    expected,
+    { resolveAnswer } = {},
+  ) {
     if (this.#signal?.aborted) {
       message.statusReaction?.clear();
       return;
@@ -872,7 +1095,7 @@ export class TextHarnessBridge {
     }
 
     const target = message.replyTarget;
-    const text = cleanText(message.content);
+    const text = controlTextOf(message);
     if (!text || hasInboundImages(message) || hasInboundFiles(message)) {
       try {
         await this.#bot.sendText(target, t('请用文字回答当前问题。'));
@@ -932,7 +1155,15 @@ export class TextHarnessBridge {
 
     const question = pending.questions[pending.index];
     if (!question) return;
-    pending.answers.push(harnessAnswerForQuestion(question, text));
+    const answer = typeof resolveAnswer === 'function'
+      ? resolveAnswer(question)
+      : harnessAnswerForQuestion(question, text);
+    if (!answer) return;
+    // Retire this question's keyboard before moving on: the answer is already in,
+    // and a card left behind in the chat stays pressable after the batch advances.
+    await this.#retireInteractionCard(pending.target, pending.cardMessageId);
+    pending.cardMessageId = null;
+    pending.answers.push(answer);
     pending.index += 1;
     if (pending.index < pending.questions.length) {
       if (pending.claimedReplyMessageId === messageId) {
@@ -1007,6 +1238,114 @@ export class TextHarnessBridge {
         );
       }
     }
+  }
+
+  /** Acknowledge a press so the client stops its spinner; never fails the answer. */
+  async #answerInteractionCallback(callback, text) {
+    if (typeof this.#bot.answerInteractionCallback !== 'function') return;
+    try {
+      await this.#bot.answerInteractionCallback(callback.callbackQueryId, text);
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] could not acknowledge a button press:`,
+        error?.message ?? error,
+      );
+    }
+  }
+
+  /** Drop a handled card's keyboard so the same press cannot be submitted twice. */
+  async #retireInteractionCard(target, providerMessageId) {
+    if (!providerMessageId || typeof this.#bot.updateInteractionCard !== 'function') return;
+    try {
+      await this.#bot.updateInteractionCard(target, providerMessageId, {
+        markup: { inline_keyboard: [] },
+      });
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] could not retire an interaction card:`,
+        error?.message ?? error,
+      );
+    }
+  }
+
+  /**
+   * Accept an inline-keyboard press. The press is replayed as the option label the
+   * text flow already understands, so a button and a typed reply share one
+   * submission path and cannot drift apart.
+   */
+  async acceptCallback(callback) {
+    if (this.#signal?.aborted) return;
+    const conversationId = cleanText(callback?.conversationId);
+    const senderId = cleanText(callback?.senderId);
+    const messageId = cleanText(callback?.messageId);
+    if (!conversationId || !senderId || !messageId || callback?.senderIsBot === true) return;
+    const kind = callback.kind === 'group' ? 'group' : 'direct';
+    const key = `${kind}:${conversationId}`;
+    const pending = this.#pendingInteractions.get(key);
+    const notice = (text) => this.#answerInteractionCallback(callback, text);
+    if (!pending) return notice(t('该问题已处理，无需再次选择。'));
+    if (pending.actor !== senderId) {
+      return notice(t('只有发起当前任务的用户可以处理这条问题。'));
+    }
+    // A press can arrive while an earlier one is still being submitted: the
+    // acknowledgement round-trip is a real window, and a user who sees no feedback
+    // presses again. Claim synchronously, before the first await, so the second
+    // press cannot advance the same question twice.
+    if (pending.submitting || pending.callbackClaimed) {
+      return notice(t('正在提交你的选择，请稍候。'));
+    }
+
+    const question = pending.questions[pending.index];
+    const parsed = this.#interactionCard?.parse?.(callback.data) ?? null;
+    const option = parsed && Array.isArray(question?.options)
+      ? question.options[parsed.optionIndex]
+      : undefined;
+    if (!question || !parsed
+      || !pending.cardNonce || parsed.nonce !== pending.cardNonce
+      || parsed.questionIndex !== pending.index
+      || !option || typeof option.label !== 'string') {
+      return notice(t('这个选项已失效，请使用最新一条问题。'));
+    }
+    // Multi-select needs a keyboard that accumulates choices and a submit action;
+    // until that exists the request keeps the text answer it has always accepted.
+    if (question.multiSelect === true) {
+      return notice(t('多选问题请直接回复文字。'));
+    }
+
+    pending.callbackClaimed = true;
+    // A press can beat the card's own send promise — Telegram delivers the update
+    // as soon as its API accepted the keyboard. Wait for delivery so the card id
+    // exists and the shared submission path can retire its keyboard.
+    await pending.presentationTask?.catch(() => undefined);
+    await notice(t('已选择：{label}', { label: option.label }));
+    await this.#processInteractionReply(
+      {
+        kind,
+        conversationId,
+        messageId,
+        senderId,
+        addressed: true,
+        content: option.label,
+        replyTarget: callback.replyTarget ?? pending.target,
+        statusReaction: null,
+      },
+      messageId,
+      senderId,
+      key,
+      pending,
+      // The press already identifies its option by index, so answer with that
+      // exact label. Replaying the label as reply text would re-parse a numeric
+      // label such as "2" as the second option and submit a different one.
+      { resolveAnswer: (current) => ({ id: current.id, selected: [option.label] }) },
+    ).catch((error) => {
+      this.#logger.error?.(
+        `[dsh-im:${this.#descriptor.key}] failed to submit a card answer:`,
+        error,
+      );
+    }).finally(() => {
+      // A failed submission rolls the question back, so let the user press again.
+      if (this.#pendingInteractions.get(key) === pending) pending.callbackClaimed = false;
+    });
   }
 
   async #handleInteraction(interaction, {
@@ -1091,6 +1430,11 @@ export class TextHarnessBridge {
       submitting: false,
       needsPresentation: true,
       presentationTask: null,
+      cardMessageId: null,
+      // Identity of the keyboard currently on screen, and the guard that keeps two
+      // presses of the same card from advancing one question twice.
+      cardNonce: null,
+      callbackClaimed: false,
     };
     this.#pendingInteractions.set(key, pending);
     this.#interactionKeys.set(interactionId, key);
@@ -1109,11 +1453,59 @@ export class TextHarnessBridge {
     this.#clearPendingInteraction(key, interactionId);
   }
 
+  /** Build card content for the current question, or null to keep the text flow. */
+  #interactionCardFor(pending, question) {
+    if (!this.#interactionCard || typeof this.#interactionCard.render !== 'function') return null;
+    if (typeof this.#bot.sendInteractionCard !== 'function') return null;
+    if (pending.submitting) return null;
+    let card = null;
+    try {
+      card = this.#interactionCard.render(question, {
+        questionIndex: pending.index,
+        total: pending.questions.length,
+        requiresMention: pending.requiresMention,
+        nonce: pending.cardNonce,
+      });
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] interaction card renderer failed:`,
+        error,
+      );
+      return null;
+    }
+    if (!card || typeof card.text !== 'string' || !card.text || !card.markup) return null;
+    return card;
+  }
+
   #presentInteraction(pending) {
     if (pending.presentationTask) return pending.presentationTask;
     const question = pending.questions[pending.index];
     if (!question) return Promise.resolve();
     const task = (async () => {
+      // A fresh nonce per presentation: a later question restarts its indexes at
+      // zero, so without one an old card's keyboard would answer the new question.
+      pending.cardNonce = randomUUID().slice(0, 8);
+      const card = this.#interactionCardFor(pending, question);
+      if (card) {
+        try {
+          const sent = await this.#bot.sendInteractionCard(pending.target, {
+            text: card.text,
+            markup: card.markup,
+          });
+          pending.cardMessageId = sent?.providerMessageIds?.at(-1) ?? null;
+          pending.needsPresentation = false;
+          return;
+        } catch (error) {
+          // A platform that refuses the keyboard must not lose the question:
+          // fall through to the plain-text flow this channel already had.
+          pending.cardMessageId = null;
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] could not deliver an interaction card; `
+              + 'falling back to plain text:',
+            error?.message ?? error,
+          );
+        }
+      }
       await this.#bot.sendText(
         pending.target,
         harnessQuestionText(

@@ -1,5 +1,14 @@
+import { deferredStateAccess, normalizeDeferredState } from './deferred-state.mjs';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+
+/**
+ * Additional persisted keys a subclass may own. Kept intentionally small and
+ * explicit: a subclass reads and writes them through extensionState().
+ */
+const EXTENSION_KEYS = Object.freeze([
+  'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds',
+]);
 
 const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [], cursor: null });
 
@@ -13,20 +22,28 @@ function normalizeState(value) {
       }
     }
   }
-  return {
+  const normalized = {
     version: 1,
     sessions,
+    ...(value.deferred ? { deferred: normalizeDeferredState(value.deferred) } : {}),
     seenMessageIds: Array.isArray(value.seenMessageIds)
       ? value.seenMessageIds.filter((id) => typeof id === 'string' && id).slice(-1_000)
       : [],
     cursor: Number.isSafeInteger(value.cursor) && value.cursor >= 0 ? value.cursor : null,
   };
+  // Channel-specific extensions survive a reload; each is normalized by the
+  // subclass that owns it (see extensionKeys()).
+  for (const key of EXTENSION_KEYS) {
+    if (Object.hasOwn(value, key)) normalized[key] = value[key];
+  }
+  return normalized;
 }
 
 export class ConversationStateStore {
   #path;
   #state = structuredClone(EMPTY_STATE);
   #writeQueue = Promise.resolve();
+  #deferred = deferredStateAccess(() => this.#state, () => this.#persist());
 
   constructor(path) {
     this.#path = path;
@@ -42,6 +59,11 @@ export class ConversationStateStore {
     }
     return this;
   }
+
+  deferredEntries() { return this.#deferred.entries(); }
+  putDeferred(entry) { return this.#deferred.put(entry); }
+  patchDeferred(id, patch) { return this.#deferred.patch(id, patch); }
+  removeDeferred(id) { return this.#deferred.remove(id); }
 
   sessionFor(key) {
     return this.#state.sessions[key] ?? null;
@@ -75,6 +97,23 @@ export class ConversationStateStore {
     await this.#persist();
   }
 
+  /**
+   * Take back a `markSeen` whose delivery never happened.
+   *
+   * `markSeen` means "this message was handled". A turn that failed before
+   * producing anything is not handled, so keeping the mark makes the id a
+   * permanent tombstone: every later poll short-circuits on `hasSeen` and the
+   * mail is never retried. The bridge calls this to separate "attempted" from
+   * "done". A message that already succeeded is never unmarked.
+   */
+  async unmarkSeen(messageId) {
+    const index = this.#state.seenMessageIds.indexOf(messageId);
+    if (index === -1) return false;
+    this.#state.seenMessageIds.splice(index, 1);
+    await this.#persist();
+    return true;
+  }
+
   cursor() {
     return this.#state.cursor;
   }
@@ -87,6 +126,20 @@ export class ConversationStateStore {
 
   snapshot() {
     return structuredClone(this.#state);
+  }
+
+  /**
+   * Live view of the private state for subclasses that persist their own keys.
+   * Returns the real object (not a clone) so an extension can be written in
+   * place; call persist() afterwards.
+   */
+  extensionState() {
+    return this.#state;
+  }
+
+  /** Flush the current state to disk after an extension write. */
+  persist() {
+    return this.#persist();
   }
 
   async remove() {

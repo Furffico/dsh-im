@@ -1,5 +1,14 @@
 // English translations (shared-c area). Keys are exact Chinese literals passed to t().
 export default {
+  '微信': 'Weixin',
+  '飞书': 'Feishu',
+  '钉钉': 'DingTalk',
+  '企业微信': 'Enterprise WeChat',
+  '{channel}正在初始化，请稍后重新读取。': '{channel} is initializing. Please reload shortly.',
+  '{channel}配置格式错误。请检查其数据目录中的 config.json 和 workspaces.json，修复后重启 DSH。详细原因请查看启动日志。': 'The {channel} configuration is invalid. Check config.json and workspaces.json in its data directory, then restart DSH. See the startup log for details.',
+  '{channel}配置格式错误。请检查其数据目录中的 config.json，修复后重启 DSH。详细原因请查看启动日志。': 'The {channel} configuration is invalid. Check config.json in its data directory, then restart DSH. See the startup log for details.',
+  '无法读取或写入{channel}配置。请检查其数据目录的访问权限，修复后重启 DSH。详细原因请查看启动日志。': 'The {channel} configuration could not be read or written. Check access to its data directory, then restart DSH. See the startup log for details.',
+  '{channel}初始化失败。请查看 DSH 启动日志中 failed to activate {id} 后的错误，修复后重启 DSH。': '{channel} initialization failed. Check the error after "failed to activate {id}" in the DSH startup log, fix it, then restart DSH.',
   // history-command.mjs / command help
   '/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）':
     '/history [count]  Preview recent messages (default 3, maximum 5)',
@@ -74,6 +83,8 @@ export default {
     'Reply with option numbers or text; separate multiple choices with commas, or add anything else.',
   '请回复一个选项序号或文字，也可直接输入其他答案。':
     'Reply with an option number or its text, or type your own answer directly.',
+  '请点击下方按钮选择，也可直接回复文字。':
+    'Tap a button below to choose, or reply with text directly.',
   '请直接回复你的答案。': 'Please reply with your answer directly.',
   '群聊中请 @机器人 后发送答案。':
     'In group chats, please @ the bot before sending your answer.',
@@ -81,6 +92,8 @@ export default {
   // image-prompt.mjs
   '当前模型不支持图片，请用 /models 查看可用模型，再用 /model <序号> 切换后重发。':
     'The current model does not support images. Use /models to list available models, switch with /model <number>, then resend.',
+  '当前会话模型不支持直接接收图片输入。用户发送的图片已作为文件保存到工作区（见下方文件清单）。请使用可用工具分析这些图片文件后回答，例如 run_code 或 pwsh 读取字节、解析元数据、调用图像处理或 OCR 库；不要假设自己能直接看到图片内容。':
+    'The current session model does not accept direct image input. The images sent by the user were saved into the workspace as files (see the file manifest below). Answer by analyzing those image files with the available tools — for example run_code or pwsh to read bytes, parse metadata, or call image-processing or OCR libraries — and do not assume you can see the images directly.',
   '图片超过宿主允许的大小，请压缩后重试。':
     'The image exceeds the size allowed by the host; compress it and try again.',
   '图片分辨率过高，请压缩后重试。':
@@ -157,15 +170,15 @@ export default {
   '当前聊天有正在运行的任务、待回答问题或待审批请求。\n请先完成当前交互或发送 /stop，再使用 /batch。':
     'This chat has a running task, unanswered question, or pending approval.\nFinish the current interaction or send /stop before using /batch.',
   '用法：/{command}（不带参数）': 'Usage: /{command} (without arguments)',
-  '批量输入命令仅支持纯文字，请移除图片或文件后重试。':
-    'Batch input commands support text only. Remove the image or file and try again.',
+  '批量输入命令仅支持纯文字，请移除图片、文件或引用消息后重试。':
+    'Batch input commands support text only. Remove the image, file, or quoted message and try again.',
   '当前没有待提交的批量内容，请先发送 /batch。':
     'There is no batch to submit. Send /batch first.',
   '当前没有正在进行的批量输入。': 'There is no active batch input.',
   '已进入批量输入模式，最多可发送 {limit} 条文字。\n完成后发送 /send，取消请发送 /cancel。':
     'Batch input started. You can send up to {limit} text messages.\nSend /send when finished or /cancel to cancel.',
-  '批量输入模式目前仅支持文字，这条消息未收录。\n请继续发送文字，或使用 /send、/cancel。':
-    'Batch input currently supports text only, so this message was not collected.\nContinue with text, or use /send or /cancel.',
+  '批量输入模式目前仅支持文字，不支持图片、文件或引用消息，这条消息未收录。\n请继续发送文字，或使用 /send、/cancel。':
+    'Batch input currently supports text only, not images, files, or quoted messages, so this message was not collected.\nContinue with text, or use /send or /cancel.',
   '当前批次正在提交，请勿重复发送 /send。':
     'The current batch is being submitted. Do not send /send again.',
   '批量内容已经提交，无法取消。\n如需停止当前任务，请发送 /stop。':
@@ -185,4 +198,6 @@ export default {
     'Collected {count}/{limit} messages. The batch is full; send /send or /cancel.',
   '批量内容提交失败，已保留 {count} 条消息。\n请再次发送 /send 重试或 /cancel 取消。':
     'Batch submission failed; {count} messages were retained.\nSend /send to retry or /cancel to cancel.',
+  '你可以发送普通消息，但没有执行命令的权限。':
+    'You can send regular messages, but you do not have permission to run commands.',
 };

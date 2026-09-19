@@ -51,6 +51,7 @@ import {
   resizeForTargetBytes,
 } from '../../../src/channels/discord/image-compress.mjs';
 import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
+import { COMMAND_PERMISSION_DENIED_MESSAGE } from '../../../src/channels/shared/inbound-access.mjs';
 import {
   DISCORD_ENDPOINTS,
   createDiscordRpcHandler,
@@ -147,6 +148,31 @@ test('Discord API retries one rate-limited message request', async () => {
   });
   assert.equal(message.id, '987654321012345678');
   assert.equal(attempts, 2);
+});
+
+test('Discord API reads a referenced message from the current channel', async () => {
+  let request;
+  const api = new DiscordApi({
+    token: TOKEN,
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return jsonResponse({
+        id: '987654321012345678',
+        channel_id: '123456789012345678',
+        content: 'quoted',
+      });
+    },
+  });
+  const message = await api.getMessage({
+    channelId: '123456789012345678',
+    messageId: '987654321012345678',
+  });
+  assert.equal(message.content, 'quoted');
+  assert.equal(
+    request.url.pathname,
+    '/api/v10/channels/123456789012345678/messages/987654321012345678',
+  );
+  assert.equal(request.options.method, 'GET');
 });
 
 test('Discord API gets a channel and starts one thread from a source message', async () => {
@@ -735,6 +761,7 @@ test('Discord controller persists a credential reference and exposes only masked
   const configPath = join(directory, 'config.json');
   const configStore = await new DiscordConfigStore(configPath).load();
   const credentialStore = credentials();
+  const proactiveSends = [];
   const controller = new DiscordController({
     credentials: credentialStore,
     configStore,
@@ -752,6 +779,10 @@ test('Discord controller persists a credential reference and exposes only masked
       },
       async start() {},
       async stop() {},
+      async sendProactiveText(...args) {
+        proactiveSends.push(args);
+        return { sent: true };
+      },
     }),
   });
   const status = await controller.bindCredentials({ token: TOKEN });
@@ -769,6 +800,11 @@ test('Discord controller persists a credential reference and exposes only masked
   const identity = deriveDiscordBotIdentity('1234567890123456789');
   assert.equal(credentialStore.values.get(identity.tokenRef), TOKEN);
   assert.doesNotMatch(await readFile(configPath, 'utf8'), new RegExp(TOKEN.replaceAll('.', '\\.')));
+  const target = { kind: 'channel', route: { channelId: '222222222222222222' } };
+  assert.deepEqual(await controller.sendProactiveText(identity.botId, target, 'proactive-test'), {
+    sent: true,
+  });
+  assert.deepEqual(proactiveSends, [[target, 'proactive-test', {}]]);
   await controller.deleteBot(identity.botId);
   assert.equal(credentialStore.values.has(identity.tokenRef), false);
 });
@@ -870,6 +906,127 @@ test('Discord normalizes DMs and only addressed server messages', () => {
     author: { id: '333333333333333334', bot: false },
     content: '',
   }, '1234567890123456789'), null);
+});
+
+test('Discord uses reply snapshots, respects deleted markers, and loads absent snapshots lazily', async () => {
+  const botId = '1234567890123456789';
+  let loads = 0;
+  const snapshot = normalizeDiscordMessage({
+    id: '111111111111111170',
+    channel_id: '222222222222222270',
+    author: { id: '333333333333333370', bot: false },
+    content: '解释原文',
+    message_reference: { message_id: '111111111111111169' },
+    referenced_message: {
+      id: '111111111111111169',
+      channel_id: '222222222222222270',
+      author: { id: '333333333333333369', username: 'alice' },
+      content: '第一层原文',
+      attachments: [
+        { filename: 'screen.png', content_type: 'image/png' },
+        { filename: 'voice.ogg', content_type: 'audio/ogg' },
+        { filename: 'clip.mp4', content_type: 'video/mp4' },
+        { filename: 'brief.pdf', content_type: 'application/pdf' },
+      ],
+      referenced_message: { content: '不应递归进入 Prompt' },
+    },
+  }, botId, { loadReply: async () => { loads += 1; } });
+  assert.equal(loads, 0);
+  assert.deepEqual(snapshot.replyTo, {
+    messageId: '111111111111111169',
+    authorId: '333333333333333369',
+    authorName: 'alice',
+    content: '第一层原文',
+    attachments: [
+      { kind: 'image', name: 'screen.png' },
+      { kind: 'audio', name: 'voice.ogg' },
+      { kind: 'video', name: 'clip.mp4' },
+      { kind: 'file', name: 'brief.pdf' },
+    ],
+  });
+  assert.doesNotMatch(JSON.stringify(snapshot.replyTo), /不应递归/);
+
+  const deleted = normalizeDiscordMessage({
+    id: '111111111111111171',
+    channel_id: '222222222222222270',
+    author: { id: '333333333333333370', bot: false },
+    content: '原文呢？',
+    message_reference: { message_id: '111111111111111168' },
+    referenced_message: null,
+  }, botId, { loadReply: async () => { loads += 1; } });
+  assert.deepEqual(deleted.replyTo, {
+    messageId: '111111111111111168',
+    unavailableReason: 'deleted',
+  });
+  assert.equal(loads, 0);
+
+  const controller = new AbortController();
+  const fallback = normalizeDiscordMessage({
+    id: '111111111111111172',
+    channel_id: '222222222222222270',
+    author: { id: '333333333333333370', bot: false },
+    content: '加载原文',
+    message_reference: { message_id: '111111111111111167' },
+  }, botId, {
+    loadReply: async (options) => {
+      loads += 1;
+      assert.deepEqual(options, {
+        channelId: '222222222222222270',
+        messageId: '111111111111111167',
+        signal: controller.signal,
+      });
+      return {
+        id: '111111111111111167',
+        channel_id: '222222222222222270',
+        author: { id: '333333333333333367', global_name: 'Bob' },
+        content: 'API 原文',
+      };
+    },
+  });
+  assert.equal(loads, 0);
+  assert.deepEqual(await fallback.replyTo.load({ signal: controller.signal }), {
+    messageId: '111111111111111167',
+    authorId: '333333333333333367',
+    authorName: 'Bob',
+    content: 'API 原文',
+    attachments: [],
+  });
+  assert.equal(loads, 1);
+
+  for (const [label, reference, referencedMessage] of [
+    ['reference channel', {
+      message_id: '111111111111111166', channel_id: '222222222222222999',
+    }, {
+      id: '111111111111111166', channel_id: '222222222222222270',
+      author: { id: '333333333333333366' }, content: 'wrong reference channel',
+    }],
+    ['snapshot channel', {
+      message_id: '111111111111111165', channel_id: '222222222222222270',
+    }, {
+      id: '111111111111111165', channel_id: '222222222222222999',
+      author: { id: '333333333333333365' }, content: 'wrong snapshot channel',
+    }],
+    ['snapshot id', {
+      message_id: '111111111111111164', channel_id: '222222222222222270',
+    }, {
+      id: '111111111111111999', channel_id: '222222222222222270',
+      author: { id: '333333333333333364' }, content: 'wrong snapshot id',
+    }],
+  ]) {
+    const invalid = normalizeDiscordMessage({
+      id: `11111111111111118${label.length}`,
+      channel_id: '222222222222222270',
+      author: { id: '333333333333333370', bot: false },
+      content: 'do not trust mismatched quote',
+      message_reference: reference,
+      referenced_message: referencedMessage,
+    }, botId, { loadReply: async () => { loads += 1; } });
+    assert.deepEqual(invalid.replyTo, {
+      messageId: reference.message_id,
+      unavailableReason: 'not-found',
+    }, label);
+  }
+  assert.equal(loads, 1, 'invalid Gateway snapshots never trigger a fallback fetch');
 });
 
 test('Discord preserves existing channel and thread addressing before native routing', () => {
@@ -1787,21 +1944,50 @@ test('Discord captures context settings before asynchronous Thread routing and u
   const routingStarted = deferred();
   const releaseRouting = deferred();
   const seen = new Set();
+  const deliveries = [];
   const prompts = [];
   let socket;
   let reads = 0;
+  let accessReads = 0;
+  let threadStarts = 0;
   let config = {
-    groupEnabled: true,
-    directEnabled: false,
-    fields: ['channel', 'conversationType', 'senderId', 'senderName', 'botId'],
-    guidance: 'accepted before routing',
+    group: {
+      enabled: true,
+      fields: ['channel', 'conversationType', 'senderId', 'senderName', 'botId'],
+      guidance: 'accepted before routing',
+    },
+    direct: { enabled: false, fields: [], guidance: 'direct must not leak' },
   };
+  const allowedAccessSettings = {
+    direct: {
+      mode: 'open',
+      open: { defaultCanExecuteCommands: true, commandPermissionOverrides: [] },
+      allowlist: { users: [] },
+    },
+    group: {
+      mode: 'allowlist',
+      open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+      allowlist: {
+        users: [
+          { id: '333333333333333333', canExecuteCommands: true },
+          { id: '333333333333333334', canExecuteCommands: false },
+        ],
+      },
+    },
+  };
+  let accessSettings = allowedAccessSettings;
   const runtime = new DiscordRuntime({
     config: { botId: 'discord_internal', platformId: botId, name: 'Harness Discord' },
     token: TOKEN,
     contextEnhancement: {
       botId: 'discord_internal',
       getSettings: () => { reads += 1; return config; },
+    },
+    accessPolicy: {
+      getSettings: () => {
+        accessReads += 1;
+        return accessSettings;
+      },
     },
     harness: {
       ensureRunning: async () => true,
@@ -1818,12 +2004,16 @@ test('Discord captures context settings before asynchronous Thread routing and u
       getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }),
       getChannel: async () => assert.fail('The channel is already in the gateway cache'),
       startThreadFromMessage: async () => {
+        threadStarts += 1;
         routingStarted.resolve();
         await releaseRouting.promise;
         return { id: threadId, type: 11, parent_id: parentId, owner_id: botId };
       },
       sendTyping: async () => {},
-      createMessage: async () => ({ id: '888888888888888890' }),
+      createMessage: async (request) => {
+        deliveries.push(request);
+        return { id: '888888888888888890' };
+      },
       editMessage: async ({ messageId }) => ({ id: messageId }),
     }),
     createWebSocket: () => {
@@ -1842,12 +2032,36 @@ test('Discord captures context settings before asynchronous Thread routing and u
     d: { id: '444444444444444444', channels: [{ id: parentId, type: 0 }], threads: [] },
   }) });
   socket.emit('message', { data: JSON.stringify({ op: 0, t: 'MESSAGE_CREATE', s: 3, d: {
+    id: '111111111111111189', channel_id: parentId, guild_id: '444444444444444444',
+    author: { id: '333333333333333332', bot: false },
+    mentions: [{ id: botId }], content: `<@${botId}> denied before Thread`,
+  } }) });
+  await eventually(() => runtime.status.messagesRejected === 1);
+  assert.equal(threadStarts, 0, 'a denied member must not create a Discord Thread');
+  socket.emit('message', { data: JSON.stringify({ op: 0, t: 'MESSAGE_CREATE', s: 4, d: {
+    id: '111111111111111188', channel_id: parentId, guild_id: '444444444444444444',
+    author: { id: '333333333333333334', bot: false },
+    mentions: [{ id: botId }], content: `<@${botId}> /new`,
+  } }) });
+  await eventually(() => runtime.status.messagesRejected === 2);
+  assert.equal(threadStarts, 0, 'a command-denied member must not create a Discord Thread');
+  assert.equal(deliveries.at(-1)?.channelId, parentId);
+  assert.equal(deliveries.at(-1)?.content, COMMAND_PERMISSION_DENIED_MESSAGE);
+  socket.emit('message', { data: JSON.stringify({ op: 0, t: 'MESSAGE_CREATE', s: 3, d: {
     id: threadId, channel_id: parentId, guild_id: '444444444444444444',
     author: { id: '333333333333333333', bot: false, global_name: 'Global Name', username: 'username' },
     member: { nick: 'Group Nick' }, mentions: [{ id: botId }], content: `<@${botId}> first`,
   } }) });
   await routingStarted.promise;
-  config = { ...config, groupEnabled: false };
+  assert.equal(threadStarts, 1);
+  config = { ...config, group: { ...config.group, enabled: false } };
+  accessSettings = {
+    ...allowedAccessSettings,
+    group: {
+      ...allowedAccessSettings.group,
+      allowlist: { users: [] },
+    },
+  };
   releaseRouting.resolve();
   await eventually(() => runtime.status.messagesReplied === 1);
   assert.match(prompts[0], /accepted before routing/);
@@ -1856,7 +2070,10 @@ test('Discord captures context settings before asynchronous Thread routing and u
     senderName: 'Group Nick', botId: 'discord_internal',
   });
   assert.equal(reads, 1, 'routing and Bridge share one accepted configuration read');
+  assert.equal(accessReads, 3,
+    'each source event reads access once and the Thread keeps its arrival decision');
 
+  accessSettings = allowedAccessSettings;
   socket.emit('message', { data: JSON.stringify({ op: 0, t: 'MESSAGE_CREATE', s: 4, d: {
     id: '111111111111111191', channel_id: threadId, guild_id: '444444444444444444',
     author: { id: '333333333333333333', bot: false }, content: 'second without enhancement',
@@ -1864,6 +2081,7 @@ test('Discord captures context settings before asynchronous Thread routing and u
   await eventually(() => runtime.status.messagesReplied === 2);
   assert.equal(prompts[1], 'second without enhancement');
   assert.equal(reads, 2);
+  assert.equal(accessReads, 4, 'the next managed-Thread event reads the latest policy once');
 });
 
 test('Discord runtime records one uncertain Thread result and suppresses Gateway replays', async () => {
@@ -1963,6 +2181,7 @@ test('Discord runtime identifies on Gateway v10 and becomes ready', async () => 
   const abortMark = deferred();
   let abortMarkStarted = false;
   const errors = [];
+  const proactiveCalls = [];
   const runtime = new DiscordRuntime({
     config: {
       botId: 'discord_test',
@@ -1987,6 +2206,10 @@ test('Discord runtime identifies on Gateway v10 and becomes ready', async () => 
     createApi: () => ({
       getCurrentUser: async () => ({ id: '1234567890123456789', bot: true }),
       getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }),
+      createMessage: async (request) => {
+        proactiveCalls.push(request);
+        return { id: '111111111111111900' };
+      },
     }),
     createWebSocket: () => {
       socket = new FakeSocket();
@@ -2003,6 +2226,14 @@ test('Discord runtime identifies on Gateway v10 and becomes ready', async () => 
   });
   await runtime.start();
   assert.equal(runtime.status.ready, true);
+  assert.deepEqual(await runtime.sendProactiveText({
+    kind: 'channel',
+    route: { channelId: '222222222222222900' },
+  }, 'proactive-test'), { providerMessageIds: ['111111111111111900'] });
+  assert.equal(proactiveCalls.length, 1);
+  assert.equal(proactiveCalls[0].channelId, '222222222222222900');
+  assert.equal(proactiveCalls[0].content, 'proactive-test');
+  assert.equal(proactiveCalls[0].replyToMessageId, undefined);
   const identify = socket.sent.find((packet) => packet.op === 2);
   assert.equal(identify.d.token, TOKEN);
   assert.equal(identify.d.intents, 37_377);
@@ -2496,7 +2727,9 @@ test('Discord session wrapper names a new Session after the channel and creation
     title: discordSessionTitle({ channelLabel: 'gaming', now }),
     options: { signal: renamed[0].options.signal },
   }]);
-  assert.equal(renamed[0].title, 'discord:gaming:20260829-1746');
+  // The channel label is carried as the leading "<label> · " prefix so the
+  // Host's session-title prefixer recognizes it as already decorated.
+  assert.equal(renamed[0].title, 'Discord · gaming:20260829-1746');
 });
 
 test('Discord runtime names a new Session from the parent channel', async (t) => {
@@ -2577,6 +2810,6 @@ test('Discord runtime names a new Session from the parent channel', async (t) =>
   await eventually(() => runtime.status.messagesReplied === 1);
   assert.deepEqual(renamed, [{
     sessionId: 'session-named',
-    title: 'discord:gaming:20260829-1746',
+    title: 'Discord · gaming:20260829-1746',
   }]);
 });

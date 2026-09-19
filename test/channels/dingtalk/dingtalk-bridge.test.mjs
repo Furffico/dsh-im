@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -15,12 +15,17 @@ import {
   DINGTALK_THINKING_REACTION_NAME,
 } from '../../../src/channels/dingtalk/dingtalk-api.mjs';
 import { connectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
+import { stageInboundFiles } from '../../../src/channels/shared/inbound-file.mjs';
 import {
   OUTBOUND_ARTIFACT_TOOL,
   OutboundArtifactRegistry,
   createOutboundArtifactTool,
   releaseOutboundArtifact,
 } from '../../../src/channels/shared/semantic/artifact.mjs';
+import {
+  COMMAND_PERMISSION_DENIED_MESSAGE,
+  directAccessPolicy,
+} from '../access-policy-fixture.mjs';
 
 function deferred() {
   let resolve;
@@ -55,17 +60,186 @@ function message(id, text, overrides = {}) {
   };
 }
 
+test('DingTalk maps undocumented repliedMsg runtime fields into a reply snapshot', () => {
+  const inbound = dingtalkInboundMessage(message('dingtalk-quote-normalize', '继续分析', {
+    text: {
+      content: '继续分析',
+      isReplyMsg: true,
+      repliedMsg: {
+        msgType: 'richText',
+        msgId: 'quoted-ding-message',
+        senderId: 'quoted-staff',
+        senderNick: '引用用户',
+        content: {
+          richText: [
+            { type: 'text', text: '被引用的说明' },
+            { type: 'picture', downloadCode: 'quoted-picture' },
+          ],
+        },
+      },
+    },
+  }));
+
+  assert.equal(inbound.content, '继续分析');
+  assert.deepEqual(inbound.replyTo, {
+    messageId: 'quoted-ding-message',
+    authorId: 'quoted-staff',
+    authorName: '引用用户',
+    content: '被引用的说明',
+    attachments: [{ kind: 'image' }],
+  });
+});
+
+test('DingTalk sends quote context to Harness but does not execute quoted commands', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:staff-approved', 'session-quote');
+  let clears = 0;
+  let prompt;
+  fixture.state.clearSession = async () => { clears += 1; };
+  const bridge = new DingtalkHarnessBridge({
+    api: { sendText: async () => ({ messageId: 'ding-quote-answer' }) },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, content) => { prompt = content; return '已处理'; },
+    },
+    state: fixture.state,
+  });
+
+  await bridge.accept(message('dingtalk-quote-prompt', '这条指令是什么意思？', {
+    text: {
+      content: '这条指令是什么意思？',
+      isReplyMsg: true,
+      repliedMsg: { msgType: 'text', msgId: 'quoted-command', content: { text: '/new' } },
+    },
+  }));
+
+  assert.equal(clears, 0);
+  assert.equal(Array.isArray(prompt), true);
+  assert.match(prompt[0].text, /<dsh_im_reply_to>/);
+  assert.match(prompt[0].text, /"content":"\/new"/);
+  assert.deepEqual(prompt.at(-1), { type: 'text', text: '这条指令是什么意思？' });
+});
+
+test('DingTalk resolves an Interactive Card reply by originalProcessQueryKey', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:staff-approved', 'session-card-quote');
+  await fixture.state.rememberOutboundMessage({
+    conversationKey: 'p2p:staff-approved',
+    text: '钉钉卡片里的完整回答',
+    sentAt: Date.now() - 2_000,
+    completedAt: Date.now() - 1_000,
+    providerMessageIds: ['dsh-card-answer'],
+  });
+  let prompt;
+  const bridge = new DingtalkHarnessBridge({
+    api: { sendText: async () => ({ messageId: 'ding-card-followup' }) },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, content) => { prompt = content; return '已识别卡片'; },
+    },
+    state: fixture.state,
+  });
+
+  await bridge.accept(message('dingtalk-card-quote', '卡片说了什么？', {
+    chatbotUserId: 'ding-client',
+    originalProcessQueryKey: 'dsh-card-answer',
+    text: {
+      content: '卡片说了什么？',
+      isReplyMsg: true,
+      repliedMsg: {
+        msgType: 'interactiveCard',
+        msgId: 'quoted-interactive-card',
+        senderId: 'ding-client',
+        createdAt: Date.now() - 2_000,
+        content: { text: '[Interactive Card Message]' },
+      },
+    },
+  }));
+
+  assert.match(prompt[0].text, /"content":"钉钉卡片里的完整回答"/);
+  assert.doesNotMatch(prompt[0].text, /unavailableReason/);
+});
+
+test('DingTalk recovers a pre-index Interactive Card reply from bounded Session history', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:staff-approved', 'session-old-card');
+  const quotedAt = Date.now() - 5_000;
+  let prompt;
+  const session = {
+    sessionExists: async () => true,
+    readHistory: async () => ({
+      events: [
+        { event: { type: 'turn/start', seq: 1, time: quotedAt, data: { turn: 2 } } },
+        { event: {
+          type: 'assistant/message',
+          seq: 2,
+          time: quotedAt + 2_000,
+          data: {
+            turn: 2,
+            message: { content: [{ type: 'text', text: '旧钉钉卡片正文' }] },
+          },
+        } },
+        { event: {
+          type: 'turn/end',
+          seq: 3,
+          time: quotedAt + 2_001,
+          data: { turn: 2, reason: { kind: 'completed' } },
+        } },
+      ],
+      hasMore: false,
+    }),
+    ask: async (content) => { prompt = content; return '已恢复旧卡片'; },
+  };
+  const bridge = new DingtalkHarnessBridge({
+    api: { sendText: async () => ({ messageId: 'ding-old-card-answer' }) },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: { workspaceSession: () => session },
+    state: fixture.state,
+  });
+
+  await bridge.accept(message('dingtalk-old-card-quote', '旧卡片说了什么？', {
+    chatbotUserId: 'ding-client',
+    text: {
+      content: '旧卡片说了什么？',
+      isReplyMsg: true,
+      repliedMsg: {
+        msgType: 'interactiveCard',
+        msgId: 'old-interactive-card',
+        senderId: 'ding-client',
+        createdAt: quotedAt,
+      },
+    },
+  }));
+
+  assert.match(prompt[0].text, /"content":"旧钉钉卡片正文"/);
+  assert.doesNotMatch(prompt[0].text, /unavailableReason/);
+});
+
 function stateFixture() {
   const sessions = new Map();
   const seen = new Set();
   const pending = new Map();
+  const outbound = [];
   return {
     sessions,
     seen,
     pending,
+    outbound,
     state: {
       hasSeen: (id) => seen.has(id),
       markSeen: async (id) => seen.add(id),
+      rememberOutboundMessage: async (entry) => outbound.push(structuredClone(entry)),
+      recentOutboundTextFor: ({ conversationKey, processQueryKey, messageId }) => {
+        const ids = [processQueryKey, messageId].filter(Boolean);
+        const matches = outbound.filter((entry) => entry.conversationKey === conversationKey
+          && ids.some((id) => entry.providerMessageIds?.includes(id)));
+        return matches.length === 1 ? matches[0].text : null;
+      },
       sessionFor: (key) => sessions.get(key) ?? null,
       setSession: async (key, sessionId) => sessions.set(key, sessionId),
       clearSession: async (key) => sessions.delete(key),
@@ -96,6 +270,205 @@ const PNG_BYTES = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   0x01, 0x02, 0x03,
 ]);
+
+for (const conversationType of ['1', '2']) {
+  for (const msgType of ['picture', 'file', 'richText', 'audio', 'video']) {
+    test(`DingTalk delivers quoted ${msgType} bytes in conversation type ${conversationType}`, async (t) => {
+      const workspace = await mkdtemp(join(tmpdir(), 'dingtalk-quoted-'));
+      t.after(() => rm(workspace, { recursive: true, force: true }));
+      const fixture = stateFixture();
+      const key = conversationType === '2' ? 'group:quoted-chat' : 'p2p:staff-approved';
+      fixture.sessions.set(key, 'quoted-session');
+      const downloads = [];
+      const prompts = [];
+      const fileBytes = Buffer.from('quoted attachment verification: ALDER-7429');
+      const image = msgType === 'picture' || msgType === 'richText';
+      const bridge = new DingtalkHarnessBridge({
+        api: {
+          downloadImage: async (request) => { downloads.push(request); return PNG_BYTES; },
+          downloadFile: async (request) => { downloads.push(request); return fileBytes; },
+          sendText: async () => {},
+        },
+        clientId: 'ding-client', clientSecret: 'host-secret', state: fixture.state,
+        harness: {
+          sessionExists: async () => true,
+          ask: async (sessionId, content, options) => {
+            const staged = await stageInboundFiles({ files: options.files }, { workspace });
+            const files = await Promise.all((staged?.files ?? []).map(async (file) => ({
+              name: file.name, bytes: await readFile(join(workspace, file.path)),
+            })));
+            await staged?.cleanup();
+            prompts.push({ sessionId, content, files });
+            return '附件已读取';
+          },
+        },
+      });
+      // Sanitized shapes captured from DingTalk desktop quotes on 2026-09-16:
+      // richText quotes use msgType/content; direct richText uses type/text.
+      const content = msgType === 'richText'
+        ? { richText: [
+            { msgType: 'picture', downloadCode: 'quoted-one' },
+            { msgType: 'text', content: '被引用的说明' },
+            { msgType: 'picture', downloadCode: 'quoted-two' },
+          ] }
+        : msgType === 'picture' ? { downloadCode: 'quoted-one' }
+          : { downloadCode: 'quoted-one', fileName: 'sample.zip',
+              fileId: 'quoted-file-id', spaceId: 'quoted-space-id' };
+      const inbound = message(`quote-${conversationType}-${msgType}`, '', {
+        conversationType, conversationId: 'quoted-chat', isInAtList: true,
+        robotCode: 'outer-robot',
+        text: { content: '读取引用附件', isReplyMsg: true, repliedMsg: {
+          msgType, content: conversationType === '1' ? content : JSON.stringify(content),
+        } },
+      });
+      await bridge.accept(inbound);
+      await bridge.accept(inbound);
+      assert.equal(prompts.length, 1);
+      assert.equal(prompts[0].sessionId, 'quoted-session');
+      assert.equal(downloads.length, msgType === 'richText' ? 2 : 1);
+      for (const request of downloads) {
+        assert.equal(request.robotCode, 'outer-robot');
+        assert.equal(request.clientId, 'ding-client');
+      }
+      assert.doesNotMatch(JSON.stringify(prompts[0].content), /quoted-one|quoted-two|host-secret/);
+      if (msgType === 'richText') assert.match(JSON.stringify(prompts[0].content), /被引用的说明/);
+      if (image) {
+        const images = prompts[0].content.filter((block) => block.type === 'image');
+        assert.equal(images.length, msgType === 'richText' ? 2 : 1);
+        for (const block of images) assert.deepEqual(Buffer.from(block.data, 'base64'), PNG_BYTES);
+      } else {
+        assert.deepEqual(prompts[0].files, [{ name: 'sample.zip', bytes: fileBytes }]);
+      }
+    });
+  }
+}
+
+test('DingTalk keeps quoted attachment downloads behind commands, access and routing', async (t) => {
+  for (const scenario of [
+    { name: 'help', text: '/help', reply: /\/workspace/ },
+    { name: 'status', text: '/status', reply: /连接正常/ },
+    { name: 'new', text: '/new', reply: /已开启新会话/ },
+    { name: 'unmentioned', overrides: { conversationType: '2', isInAtList: false } },
+    { name: 'unsafe route', overrides: { sessionWebhook: 'https://example.com/reply' } },
+    { name: 'denied sender', accessPolicy: directAccessPolicy() },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const sent = [];
+      let downloads = 0;
+      let asks = 0;
+      const fixture = stateFixture();
+      fixture.sessions.set('p2p:staff-approved', 'old-session');
+      const bridge = new DingtalkHarnessBridge({
+        api: {
+          sendText: async ({ text }) => sent.push(text),
+          downloadFile: async () => { downloads += 1; return Buffer.from('file'); },
+        },
+        clientId: 'client', clientSecret: 'secret', state: fixture.state,
+        accessPolicy: scenario.accessPolicy,
+        harness: {
+          ensureRunning: async () => {},
+          ask: async () => { asks += 1; return 'unexpected'; },
+        },
+      });
+      await bridge.accept(message(`quoted-gate-${scenario.name}`, '', {
+        ...scenario.overrides,
+        text: { content: scenario.text ?? 'read', isReplyMsg: true, repliedMsg: {
+          msgType: 'file', content: { downloadCode: 'quoted-file', fileName: 'file.txt' },
+        } },
+      }));
+      assert.equal(downloads, 0);
+      assert.equal(asks, 0);
+      if (scenario.reply) assert.match(sent.join('\n'), scenario.reply);
+      if (scenario.name === 'new') assert.equal(fixture.sessions.size, 0);
+    });
+  }
+});
+
+test('DingTalk refuses incomplete or failed quoted attachments instead of sending metadata only', async (t) => {
+  for (const scenario of [
+    { name: 'missing file code', type: 'file', content: { fileName: 'sample.txt' }, expected: /未提供引用附件的下载信息/ },
+    { name: 'missing image code', type: 'picture', content: {}, expected: /未提供引用附件的下载信息/ },
+    { name: 'one missing rich image', type: 'richText', content: { richText: [
+      { type: 'picture', downloadCode: 'one' }, { type: 'picture' },
+    ] }, expected: /未提供引用附件的下载信息/ },
+    { name: 'image download rejected', type: 'picture', content: { downloadCode: 'rejected' }, expected: /图片下载失败/ },
+    { name: 'file download rejected', type: 'file', content: { downloadCode: 'rejected' }, expected: /文件下载失败/ },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const workspace = await mkdtemp(join(tmpdir(), 'dingtalk-quoted-error-'));
+      t.after(() => rm(workspace, { recursive: true, force: true }));
+      const fixture = stateFixture();
+      fixture.sessions.set('p2p:staff-approved', 'quote-session');
+      const sent = [];
+      let modelRequests = 0;
+      const reject = async () => { throw new Error('private provider failure detail'); };
+      const bridge = new DingtalkHarnessBridge({
+        api: { sendText: async ({ text }) => sent.push(text), downloadFile: reject, downloadImage: reject },
+        clientId: 'client', clientSecret: 'secret', state: fixture.state, logger: { error() {} },
+        harness: {
+          sessionExists: async () => true,
+          ask: async (_sessionId, _prompt, options) => {
+            await stageInboundFiles({ files: options.files }, { workspace });
+            modelRequests += 1;
+            return 'unexpected';
+          },
+        },
+      });
+      await bridge.accept(message(`quoted-error-${scenario.name}`, '', {
+        text: { content: 'read', isReplyMsg: true, repliedMsg: {
+          msgType: scenario.type, content: scenario.content,
+        } },
+      }));
+      assert.equal(modelRequests, 0);
+      assert.match(sent.join('\n'), scenario.expected);
+      assert.doesNotMatch(sent.join('\n'), /private provider failure detail/);
+    });
+  }
+});
+
+test('DingTalk preserves current attachments and deduplicates only exact quoted download codes', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:staff-approved', 'quote-session');
+  const downloads = [];
+  const prompts = [];
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      sendText: async () => {},
+      downloadImage: async ({ downloadCode }) => { downloads.push(downloadCode); return PNG_BYTES; },
+      downloadFile: async ({ downloadCode }) => { downloads.push(downloadCode); return Buffer.from('file'); },
+    },
+    clientId: 'client', clientSecret: 'secret', state: fixture.state,
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, prompt, options) => {
+        for (const file of options.files) await file.load({});
+        prompts.push({ prompt, files: options.files.length });
+        return 'done';
+      },
+    },
+  });
+  const repliedMsg = { msgType: 'richText', content: { richText: [
+    { type: 'picture', downloadCode: 'same' },
+    { type: 'picture', downloadCode: 'new' },
+    { type: 'picture', downloadCode: 'new' },
+  ] } };
+  await bridge.accept(message('current-and-quoted-pictures', '', {
+    msgtype: 'picture', content: { downloadCode: 'same' },
+    text: { isReplyMsg: true, repliedMsg },
+  }));
+  assert.deepEqual(downloads, ['same', 'new']);
+  assert.equal(prompts[0].prompt.filter((block) => block.type === 'image').length, 2);
+
+  downloads.length = 0;
+  await bridge.accept(message('current-and-quoted-files', '', {
+    msgtype: 'file', content: { downloadCode: 'native', fileName: 'same-name.txt' },
+    text: { isReplyMsg: true, repliedMsg: { msgType: 'file', content: {
+      downloadCode: 'quoted', fileName: 'same-name.txt',
+    } } },
+  }));
+  assert.deepEqual(downloads, ['native', 'quoted']);
+  assert.equal(prompts[1].files, 2, 'the already-prefetched native file is retained without another download');
+});
 
 async function committedArtifact(t, fileName, content) {
   const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-dingtalk-artifact-'));
@@ -681,6 +1054,75 @@ test('DingTalk checks the group mention before downloading a picture', async () 
   assert.equal(asks, 0);
 });
 
+test('DingTalk applies the unified access policy before attachments or Harness work', async () => {
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:staff-member', 'session-member');
+  let downloads = 0;
+  const harnessCalls = [];
+  const sent = [];
+  const accessPolicy = directAccessPolicy({
+    users: [{ id: 'staff-member', canExecuteCommands: false }],
+    privilegedIds: ['staff-owner'],
+  });
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      downloadImage: async () => {
+        downloads += 1;
+        return PNG_BYTES;
+      },
+      sendText: async ({ text }) => {
+        sent.push(text);
+        return { messageId: `dingtalk-policy-${sent.length}` };
+      },
+    },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    accessPolicy,
+    harness: {
+      sessionExists: async (sessionId) => {
+        harnessCalls.push(['sessionExists', sessionId]);
+        return true;
+      },
+      ask: async (sessionId, prompt) => {
+        harnessCalls.push(['ask', sessionId, prompt]);
+        return '白名单消息已处理';
+      },
+    },
+    state: fixture.state,
+  });
+
+  await bridge.accept(message('policy-blocked-picture', '', {
+    senderStaffId: 'staff-blocked',
+    msgtype: 'picture',
+    text: undefined,
+    content: { downloadCode: 'blocked-picture' },
+    robotCode: 'robot-code',
+  }));
+  assert.equal(downloads, 0);
+  assert.deepEqual(harnessCalls, []);
+  assert.deepEqual(sent, []);
+
+  await bridge.accept(message('policy-member-text', '普通消息', {
+    senderStaffId: 'staff-member',
+  }));
+  assert.equal(harnessCalls.some(([operation]) => operation === 'ask'), true);
+  assert.deepEqual(sent, ['白名单消息已处理']);
+
+  const callsBeforeDeniedCommand = harnessCalls.length;
+  const repliesBeforeDeniedCommand = sent.length;
+  await bridge.accept(message('policy-member-command', '/help', {
+    senderStaffId: 'staff-member',
+  }));
+  assert.equal(harnessCalls.length, callsBeforeDeniedCommand);
+  assert.deepEqual(sent.slice(repliesBeforeDeniedCommand), [COMMAND_PERMISSION_DENIED_MESSAGE]);
+
+  accessPolicy.getSettings().direct.allowlist.users = [];
+  await bridge.accept(message('policy-owner-command', '/help', {
+    senderStaffId: 'staff-owner',
+  }));
+  assert.match(sent.at(-1), /\/help/);
+});
+
 test('DingTalk returns a specific retry message when picture download fails', async () => {
   const fixture = stateFixture();
   fixture.sessions.set('p2p:staff-approved', 'session-image');
@@ -742,7 +1184,7 @@ test('DingTalk exposes a structured model rate limit without changing connection
 
   const failure = status.lastMessageError;
   assert.equal(failure.code, 'MODEL_RATE_LIMIT');
-  assert.equal(failure.reason, 'MODEL_RATE_LIMIT');
+  assert.equal(failure.reason, 'HARNESS_TURN_FAILED');
   assert.match(failure.referenceId, /^MF-[A-F0-9]{8}$/);
   assert.match(sent.at(-1), /模型服务正在限流，本次任务未完成。请稍后重试。/);
   assert.equal(sent.at(-1).endsWith(`参考号：${failure.referenceId}`), true);
@@ -1338,6 +1780,8 @@ test('bridge streams one AI Card and mentions only the group sender without an e
       assert.equal(calls.finish.length, 1);
       assert.equal(calls.finish[0].text, '最终完整回答');
       assert.equal(calls.text.length, 0);
+      assert.deepEqual(fixture.outbound.at(-1).providerMessageIds, ['card-one']);
+      assert.equal(fixture.outbound.at(-1).text, '最终完整回答');
       assert.equal(bridge.status.messagesReplied, 1);
     });
   }
@@ -1383,6 +1827,113 @@ test('bridge falls back to final text with group sender mentions when AI Card cr
       assert.equal(bridge.status.messagesReplied, 1);
     });
   }
+});
+
+test('bridge delivers text after an active AI Card fails during progress or finalization', async (t) => {
+  for (const stage of ['update', 'finish']) {
+    for (const modelFails of [false, true]) {
+      for (const conversationType of ['1', '2']) {
+        await t.test(`${stage}, modelFails=${modelFails}, conversationType=${conversationType}`, async () => {
+          const fixture = stateFixture();
+          const sent = [];
+          const closed = [];
+          const finished = [];
+          const bridge = new DingtalkHarnessBridge({
+            api: {
+              createAiCard: async () => ({ cardInstanceId: 'card-one' }),
+              updateAiCard: async () => { throw new Error('card update rejected'); },
+              finishAiCard: async (request) => {
+                finished.push(request);
+                throw new Error('card final frame rejected');
+              },
+              failAiCard: async (request) => closed.push(request),
+              sendText: async (request) => {
+                sent.push(request);
+                return { messageId: 'fallback-message' };
+              },
+            },
+            clientId: 'ding-client',
+            clientSecret: 'host-secret',
+            harness: {
+              sessionExists: async () => false,
+              createSession: async () => 'session-card-failure',
+              ask: async (_sessionId, _text, options) => {
+                if (stage === 'update') {
+                  options.onUpdate({ type: 'text', text: '生成中的进度' });
+                  await eventually(() => closed.length === 1, 'failed progress must close the card');
+                }
+                if (modelFails) throw new Error('private model failure');
+                return '最终完整回答';
+              },
+            },
+            state: fixture.state,
+            logger: { error() {}, warn() {} },
+          });
+
+          await bridge.accept(message('active-card-failure', '请回答', {
+            conversationType,
+            isInAtList: true,
+          }));
+
+          assert.equal(closed.length, 1);
+          assert.equal(closed[0].text, '卡片已结束，请查看后续消息。');
+          assert.equal(finished.length, stage === 'finish' ? 1 : 0);
+          assert.equal(sent.length, 1);
+          assert.deepEqual(sent[0].at, conversationType === '2'
+            ? { atUserIds: ['staff-approved'] }
+            : undefined);
+          if (modelFails) {
+            assert.match(sent[0].text, /参考号：MF-[A-F0-9]{8}/);
+            assert.doesNotMatch(sent[0].text, /private model failure|host-secret/);
+            assert.equal(bridge.status.messagesReplied, 0);
+            assert.equal(fixture.outbound.length, 0);
+          } else {
+            assert.equal(sent[0].text, '最终完整回答');
+            assert.equal(bridge.status.messagesReplied, 1);
+            assert.equal(bridge.status.lastError, null);
+            assert.equal(fixture.outbound.length, 1);
+            assert.equal(fixture.outbound[0].text, '最终完整回答');
+            assert.deepEqual(fixture.outbound[0].providerMessageIds, ['fallback-message']);
+          }
+        });
+      }
+    }
+  }
+});
+
+test('bridge does not record a delivered answer when both the AI Card and text fallback fail', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      createAiCard: async () => ({ cardInstanceId: 'card-one' }),
+      updateAiCard: async () => {},
+      finishAiCard: async () => { throw new Error('card rejected'); },
+      failAiCard: async () => {},
+      sendText: async (request) => {
+        sent.push(request);
+        throw new Error('text rejected');
+      },
+    },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: {
+      sessionExists: async () => false,
+      createSession: async () => 'session-no-delivery',
+      ask: async () => '最终完整回答',
+    },
+    state: fixture.state,
+    logger: { error() {}, warn() {} },
+  });
+
+  await bridge.accept(message('no-delivery', '请回答'));
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].text, '最终完整回答');
+  assert.match(sent[1].text, /参考号：MF-[A-F0-9]{8}/);
+  assert.equal(bridge.status.messagesReplied, 0);
+  assert.ok(bridge.status.lastError);
+  assert.equal(fixture.outbound.length, 0);
 });
 
 test('commands stay local and unsafe session webhooks are rejected before Harness', async () => {
@@ -2370,15 +2921,24 @@ test('DingTalk private batch input submits once, cancels cleanly, and restores n
   });
 
   await bridge.accept(message('batch-start', '/batch'));
+  await bridge.accept(message('batch-quote', '钉钉引用不能收录', {
+    text: {
+      content: '钉钉引用不能收录',
+      isReplyMsg: true,
+      repliedMsg: { msgType: 'text', content: { text: '被引用内容' } },
+    },
+  }));
   await bridge.accept(message('batch-one', '第一条'));
   await bridge.accept(message('batch-two', '第二条'));
   assert.deepEqual(asked, []);
-  assert.equal(sent.length, 1, 'only /batch acknowledges before submission');
+  assert.equal(sent.length, 2, '/batch and the rejected quote acknowledge before submission');
+  assert.match(sent[1], /引用消息.*未收录/s);
 
   await bridge.accept(message('batch-send', '/send'));
   assert.equal(asked.length, 1);
   assert.match(asked[0], /\[消息 1\]\n第一条/);
   assert.match(asked[0], /\[消息 2\]\n第二条/);
+  assert.doesNotMatch(asked[0], /钉钉引用不能收录/);
   assert.equal(sent.at(-1), '批量完成');
 
   await bridge.accept(message('cancel-start', '/batch'));
@@ -2544,4 +3104,75 @@ test('DingTalk group batch commands are rejected without reaching Harness', asyn
 
   assert.equal(asks, 0);
   assert.match(sent.at(-1), /仅支持私聊/);
+});
+
+test('native menu selects exact session without a second message and updates the same card', async () => {
+  const fixture = stateFixture();
+  const cards = [];
+  const updates = [];
+  const sent = [];
+  const accessPolicy = directAccessPolicy({ users: [{ id: 'staff-approved', canExecuteCommands: true }] });
+  const harness = {
+    currentWorkspace: () => process.cwd(),
+    listWorkspaces: async () => [process.cwd()],
+    listWorkspaceSessions: async () => ({ sessions: [{ sessionId: 'session-a', title: 'Existing session' }] }),
+    bindWorkspaceSession: async (key, sessionId) => {
+      fixture.sessions.set(key, sessionId);
+      return { sessionId, title: 'Existing session', workspace: process.cwd() };
+    },
+    agentPresetSettings: async () => ({ agentPresetCatalog: { items: [{ id: '123', label: 'Numeric preset' }] } }),
+    listModels: async () => ({ groups: [{ id: 'deepseek', models: [{ id: 'flash', name: 'Flash' }] }], current: { provider: 'deepseek', model: 'flash' } }),
+    ask: async () => assert.fail('menu must not reach the model'),
+  };
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      sendText: async ({ text }) => sent.push(text),
+      createMenuCard: async (args) => { cards.push(args); return { cardInstanceId: 'menu-one' }; },
+      updateMenuCard: async (args) => updates.push(args),
+    },
+    clientId: 'client', clientSecret: 'secret', harness, state: fixture.state,
+    accessPolicy, logger: { warn() {}, info() {} },
+  });
+  await bridge.accept(message('open-menu', '/m'));
+  assert.equal(cards.length, 1);
+  assert.deepEqual(cards[0].data.session_options.map(x => x.text.zh_CN), ['新会话', 'Existing session']);
+  assert.equal(cards[0].data.model_index, 0);
+  const callback = {
+    outTrackId: 'menu-one', userId: 'staff-approved',
+    content: JSON.stringify({ cardPrivateData: { actionIds: ['session'], params: {
+      revision: cards[0].data.revision, session: { index: 1, value: '1' },
+    } } }),
+  };
+  await bridge.acceptCard({ ...callback, userId: 'another-user' }, 'wrong-user');
+  await bridge.acceptCard({ ...callback, content: '{' }, 'malformed');
+  assert.equal(updates.length, 0);
+  await bridge.acceptCard(callback, 'select-session');
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].cardInstanceId, 'menu-one');
+  assert.equal(fixture.state.sessionFor('p2p:staff-approved'), 'session-a');
+  assert.equal(updates[0].data.session_index, 1);
+  assert.equal(cards.length, 1);
+  assert.equal(sent.length, 0);
+  await bridge.acceptCard(callback, 'select-session');
+  await bridge.acceptCard(callback, 'stale-revision');
+  assert.equal(updates.length, 1);
+
+  const freshCallback = (action) => ({ ...callback, content: JSON.stringify({ cardPrivateData: {
+    actionIds: [action], params: { revision: updates.at(-1).data.revision },
+  } }) });
+  fixture.sessions.set('p2p:staff-approved', 'session-changed-elsewhere');
+  await bridge.acceptCard(freshCallback('new'), 'changed-session');
+  assert.equal(fixture.state.sessionFor('p2p:staff-approved'), 'session-changed-elsewhere');
+  assert.match(updates.at(-1).data.notice, /菜单已刷新/);
+
+  await bridge.accept(message('start-batch', '/batch'));
+  await bridge.acceptCard(freshCallback('new'), 'busy-batch');
+  assert.equal(fixture.state.sessionFor('p2p:staff-approved'), 'session-changed-elsewhere');
+  assert.match(updates.at(-1).data.notice, /当前任务尚未结束/);
+  await bridge.accept(message('cancel-batch', '/cancel'));
+
+  accessPolicy.getSettings().direct.allowlist.users[0].canExecuteCommands = false;
+  await bridge.acceptCard(freshCallback('new'), 'revoked-permission');
+  assert.equal(fixture.state.sessionFor('p2p:staff-approved'), 'session-changed-elsewhere');
+  assert.deepEqual(updates.at(-1).data, { notice: COMMAND_PERMISSION_DENIED_MESSAGE });
 });

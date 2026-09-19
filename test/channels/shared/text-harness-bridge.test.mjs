@@ -7,6 +7,7 @@ import manifest from '../../../package.json' with { type: 'json' };
 
 import { DiscordHarnessBridge } from '../../../src/channels/discord/discord-bridge.mjs';
 import { connectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
+import { COMMAND_PERMISSION_DENIED_MESSAGE } from '../../../src/channels/shared/inbound-access.mjs';
 import { InboundFileError } from '../../../src/channels/shared/inbound-file.mjs';
 import {
   OUTBOUND_ARTIFACT_TOOL,
@@ -20,6 +21,7 @@ import {
 } from '../../../src/channels/shared/text-harness-bridge.mjs';
 import { SlackHarnessBridge } from '../../../src/channels/slack/slack-bridge.mjs';
 import { TelegramHarnessBridge } from '../../../src/channels/telegram/telegram-bridge.mjs';
+import { TelegramBotClient } from '../../../src/channels/telegram/telegram-runtime.mjs';
 import { WhatsappHarnessBridge } from '../../../src/channels/whatsapp/whatsapp-bridge.mjs';
 
 function deferred() {
@@ -70,6 +72,7 @@ function stateFixture(initialSessions = {}) {
       async clearSession(key) { sessions.delete(key); },
       hasSeen(messageId) { return seen.has(messageId); },
       async markSeen(messageId) { seen.add(messageId); },
+      async unmarkSeen(messageId) { return seen.delete(messageId); },
     },
   };
 }
@@ -85,6 +88,21 @@ function message(messageId, content, overrides = {}) {
     addressed: true,
     replyTarget: { id: `target-${messageId}` },
     ...overrides,
+  };
+}
+
+function accessPolicy({ canExecuteCommands = false } = {}) {
+  return {
+    direct: {
+      mode: 'allowlist',
+      open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+      allowlist: { users: [{ id: 'actor-a', canExecuteCommands }] },
+    },
+    group: {
+      mode: 'allowlist',
+      open: { defaultCanExecuteCommands: false, commandPermissionOverrides: [] },
+      allowlist: { users: [] },
+    },
   };
 }
 
@@ -277,6 +295,140 @@ test('shared status reactions replace processing with success without joining th
   ]);
 });
 
+test('all four shared text channels enforce fail-closed live access before side effects', async () => {
+  for (const [name, Bridge] of [
+    ['slack', SlackHarnessBridge],
+    ['telegram', TelegramHarnessBridge],
+    ['discord', DiscordHarnessBridge],
+    ['whatsapp', WhatsappHarnessBridge],
+  ]) {
+    const fixture = stateFixture();
+    const sent = [];
+    const asks = [];
+    let imageLoads = 0;
+    let sessionClears = 0;
+    let policyReadFails = true;
+    let settings = null;
+    const originalClearSession = fixture.state.clearSession.bind(fixture.state);
+    fixture.state.clearSession = async (...args) => {
+      sessionClears += 1;
+      return originalClearSession(...args);
+    };
+    const bridge = new Bridge({
+      accessPolicy: {
+        getSettings() {
+          if (policyReadFails) throw new Error('private policy read detail');
+          return settings;
+        },
+        isPrivileged: (senderIds) => senderIds.includes('owner-a'),
+      },
+      bot: { sendText: async (_target, text) => sent.push(text) },
+      state: fixture.state,
+      harness: {
+        createSession: async () => `session-access-${name}`,
+        sessionExists: async () => true,
+        ask: async (_sessionId, content) => {
+          asks.push(content);
+          return `${name} allowed reply`;
+        },
+      },
+    });
+
+    await bridge.accept(message(`access-blocked-${name}`, 'blocked attachment', {
+      images: [{
+        mediaType: 'image/png',
+        load: async () => {
+          imageLoads += 1;
+          return Buffer.from('must not load');
+        },
+      }],
+    }));
+    assert.equal(imageLoads, 0, `${name} authorizes before downloading attachments`);
+    assert.deepEqual(asks, [], `${name} fail-closed denial never reaches Harness`);
+    assert.equal(fixture.seen.has(`access-blocked-${name}`), true,
+      `${name} records a denial for replay suppression`);
+
+    await bridge.accept(message(`access-owner-${name}`, '/help', { senderId: 'owner-a' }));
+    assert.match(sent.at(-1), /\/help/, `${name} owner bypasses a failed policy read`);
+    assert.deepEqual(asks, [], `${name} owner command remains local`);
+
+    policyReadFails = false;
+    settings = accessPolicy();
+    await bridge.accept(message(`access-blocked-${name}`, 'replayed after policy update'));
+    assert.deepEqual(asks, [], `${name} a denied replay cannot bypass the new policy`);
+
+    await bridge.accept(message(`access-ordinary-${name}`, 'allowed ordinary message'));
+    assert.equal(asks.length, 1, `${name} applies the live policy to a new event`);
+    assert.equal(sent.at(-1), `${name} allowed reply`, `${name} keeps the normal reply path`);
+
+    await bridge.accept(message(`access-command-denied-${name}`, '/new'));
+    assert.equal(asks.length, 1, `${name} denied command never reaches Harness`);
+    assert.equal(sessionClears, 0, `${name} denied command has no command side effect`);
+    assert.equal(sent.at(-1), COMMAND_PERMISSION_DENIED_MESSAGE, `${name} explains command denial`);
+
+    settings = accessPolicy({ canExecuteCommands: true });
+    await bridge.accept(message(`access-command-allowed-${name}`, '/new'));
+    assert.equal(sessionClears, 1, `${name} policy hot-update applies without rebuilding the bridge`);
+    assert.equal(asks.length, 1, `${name} allowed local command is not a model prompt`);
+  }
+});
+
+test('all four shared text channels resolve replies only after trigger and command gates', async () => {
+  for (const [name, Bridge] of [
+    ['slack', SlackHarnessBridge],
+    ['telegram', TelegramHarnessBridge],
+    ['discord', DiscordHarnessBridge],
+    ['whatsapp', WhatsappHarnessBridge],
+  ]) {
+    const fixture = stateFixture();
+    const sent = [];
+    const asks = [];
+    let replyLoads = 0;
+    const replyTo = () => ({
+      messageId: `quoted-${name}`,
+      load: async () => {
+        replyLoads += 1;
+        return {
+          messageId: `quoted-${name}`,
+          authorName: 'Original author',
+          content: '/new 只是被引用的原文',
+          attachments: [{ kind: 'file', name: 'brief.pdf' }],
+        };
+      },
+    });
+    const bridge = new Bridge({
+      bot: { sendText: async (_target, text) => sent.push(text) },
+      state: fixture.state,
+      harness: {
+        createSession: async () => `session-reply-${name}`,
+        sessionExists: async () => true,
+        ask: async (_sessionId, content) => {
+          asks.push(content);
+          return `${name} reply`;
+        },
+      },
+    });
+
+    await bridge.accept(message(`reply-unaddressed-${name}`, 'ignored', {
+      kind: 'group',
+      conversationId: `group-${name}`,
+      addressed: false,
+      replyTo: replyTo(),
+    }));
+    await bridge.accept(message(`reply-help-${name}`, '/help', { replyTo: replyTo() }));
+    assert.equal(replyLoads, 0, `${name} does not fetch before trigger and command gates`);
+    assert.equal(asks.length, 0, name);
+
+    await bridge.accept(message(`reply-question-${name}`, '当前问题', { replyTo: replyTo() }));
+    assert.equal(replyLoads, 1, `${name} resolves once at the model prompt stage`);
+    assert.equal(asks.length, 1, name);
+    assert.equal(Array.isArray(asks[0]), true, name);
+    assert.match(asks[0][0].text, /^<dsh_im_reply_to>/, name);
+    assert.match(asks[0][0].text, /\/new 只是被引用的原文/, name);
+    assert.deepEqual(asks[0][1], { type: 'text', text: '当前问题' }, name);
+  }
+});
+
 test('runtime abort clears a queued interaction reply reaction instead of marking success', async () => {
   const fixture = stateFixture();
   const controller = new AbortController();
@@ -411,7 +563,7 @@ test('all four shared text channels expose structured model rate limits without 
 
     const failure = status.lastMessageError;
     assert.equal(failure.code, 'MODEL_RATE_LIMIT', name);
-    assert.equal(failure.reason, 'MODEL_RATE_LIMIT', name);
+    assert.equal(failure.reason, 'HARNESS_TURN_FAILED', name);
     assert.match(failure.referenceId, /^MF-[A-F0-9]{8}$/, name);
     assert.match(sent.at(-1), /模型服务正在限流，本次任务未完成。请稍后重试。/, name);
     assert.equal(sent.at(-1).endsWith(`参考号：${failure.referenceId}`), true, name);
@@ -620,6 +772,13 @@ test('private batch input enforces text-only collection, command blocking, the l
   await bridge.accept(message('limited-file', 'file caption', {
     files: [{ name: 'data.txt', data: Buffer.from('data') }],
   }));
+  let replyLoads = 0;
+  await bridge.accept(message('limited-reply', 'quoted caption', {
+    replyTo: {
+      content: 'quoted text',
+      load: async () => { replyLoads += 1; return { content: 'must not load' }; },
+    },
+  }));
   await bridge.accept(message('limited-unsupported-media', 'video caption', {
     plainText: false,
   }));
@@ -634,7 +793,8 @@ test('private batch input enforces text-only collection, command blocking, the l
   await bridge.accept(message('limited-cancel', '/cancel'));
 
   assert.equal(asks, 0, 'collection and cancellation never call Harness');
-  assert.equal(sent.filter((text) => text.includes('目前仅支持文字')).length, 3);
+  assert.equal(replyLoads, 0, 'batch collection never resolves quoted content');
+  assert.equal(sent.filter((text) => text.includes('目前仅支持文字')).length, 4);
   assert.equal(sent.some((text) => text.includes('先发送 /send 提交或 /cancel 取消')), true);
   assert.equal(sent.some((text) => /10\/10.*已满/.test(text)), true);
   assert.equal(sent.some((text) => text.includes('这条消息未收录')), true);
@@ -2301,7 +2461,7 @@ test('keeps a failed interaction response pending so the actor can retry', async
   });
 
   const processing = bridge.accept(message('retry-start', '启动可重试交互'));
-  await eventually(() => sent.some(({ text }) => text.includes('请回答')));
+  await eventually(() => sent.some(({ text }) => text.includes('请回答')), 5_000);
   await bridge.accept(message('retry-first', '第一次答案', {
     reactionTarget: { id: 'source-retry-first' },
   }));
@@ -2354,7 +2514,7 @@ test('notifies the actor when an in-flight response resolves elsewhere before re
   });
 
   const processing = bridge.accept(message('response-race-start', '启动提交竞态'));
-  await eventually(() => sent.some(({ text }) => text.includes('请回答')));
+  await eventually(() => sent.some(({ text }) => text.includes('请回答')), 5_000);
   await bridge.accept(message('response-race-answer', '已经收到的答案'));
   await processing;
 
@@ -2591,4 +2751,513 @@ test('passes the runtime signal to Harness and safely cancels a pending question
       details: {},
     },
   });
+});
+
+test('shared bridge keepalives a short-lived draft stream and stops the timer on completion', async () => {
+  const fixture = stateFixture();
+  const refreshes = [];
+  const typings = [];
+  let releaseAsk;
+  const gate = new Promise((resolve) => { releaseAsk = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    bot: {
+      sendText: async () => 'done',
+      sendTyping: async () => { typings.push(Date.now()); },
+      openDeliveryStream: async () => ({
+        keepalive: true,
+        refresh: async () => { refreshes.push(Date.now()); },
+        update: async () => undefined,
+        finish: async () => undefined,
+        fail: async () => undefined,
+      }),
+    },
+    harness: {
+      createSession: async () => 'session-keepalive',
+      ask: async () => {
+        await gate;
+        return 'long answer';
+      },
+    },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+    keepaliveIntervalMs: 15,
+  });
+
+  const accepted = bridge.accept(message('keepalive-draft', '跑一个长任务'));
+  await eventually(() => refreshes.length >= 2, 2_000);
+  assert.ok(refreshes.length >= 2, 'heartbeat refreshes the draft repeatedly during the long turn');
+  assert.ok(typings.length >= 1, 'heartbeat also refreshes the typing indicator');
+  releaseAsk();
+  await accepted;
+
+  const stoppedAt = refreshes.length;
+  const typingAt = typings.length;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(refreshes.length, stoppedAt, 'no refresh after the turn ends');
+  assert.equal(typings.length, typingAt, 'no typing after the turn ends');
+});
+
+test('shared bridge clears the keepalive timer when a long turn fails', async () => {
+  const fixture = stateFixture();
+  const refreshes = [];
+  let releaseAsk;
+  const gate = new Promise((resolve) => { releaseAsk = resolve; });
+  const failure = new Error('private provider failure');
+  failure.code = 'harness-turn-failed';
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    bot: {
+      sendText: async () => 'done',
+      openDeliveryStream: async () => ({
+        keepalive: true,
+        refresh: async () => { refreshes.push(Date.now()); },
+        update: async () => undefined,
+        finish: async () => undefined,
+        fail: async () => undefined,
+      }),
+    },
+    harness: {
+      createSession: async () => 'session-keepalive-fail',
+      ask: async () => {
+        await gate;
+        throw failure;
+      },
+    },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+    keepaliveIntervalMs: 15,
+  });
+
+  const accepted = bridge.accept(message('keepalive-fail', '会失败的長任务'));
+  await eventually(() => refreshes.length >= 2, 2_000);
+  releaseAsk();
+  await accepted;
+
+  const stoppedAt = refreshes.length;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(refreshes.length, stoppedAt, 'no refresh leaks after a failed turn');
+});
+
+test('shared bridge never starts a keepalive timer for a non-keepalive stream', async () => {
+  const fixture = stateFixture();
+  const refreshes = [];
+  const typings = [];
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    bot: {
+      sendText: async () => 'done',
+      sendTyping: async () => { typings.push(Date.now()); },
+      openDeliveryStream: async () => ({
+        keepalive: false,
+        refresh: async () => { refreshes.push(Date.now()); },
+        update: async () => undefined,
+        finish: async () => undefined,
+      }),
+    },
+    harness: {
+      createSession: async () => 'session-non-keepalive',
+      ask: async () => 'plain answer',
+    },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+    keepaliveIntervalMs: 10,
+  });
+
+  await bridge.accept(message('non-keepalive', '普通任务'));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(refreshes.length, 0, 'non-keepalive carriers are never heartbeat-refreshed');
+  assert.equal(typings.length, 1, 'only the initial typing indicator is sent');
+});
+
+test('Telegram question clears the draft after pending writes and keeps replies enabled until the final answer', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const fixture = stateFixture();
+  const refreshGate = deferred();
+  const answered = deferred();
+  const drafts = [];
+  const messages = [];
+  const finals = [];
+  let options;
+  let draftActive = false;
+  const target = { chatId: 42, chatType: 'private' };
+  const bot = new TelegramBotClient({
+    api: {
+      sendChatAction: async () => true,
+      sendRichMessageDraft: async (payload) => {
+        drafts.push(payload);
+        if (drafts.length === 2) await refreshGate.promise;
+        draftActive = true;
+        return true;
+      },
+      sendMessage: async (payload) => {
+        // Telegram clears a live draft when a regular message arrives.
+        draftActive = false;
+        messages.push(payload);
+        return { message_id: 199 };
+      },
+      sendRichMessage: async (payload) => {
+        finals.push(payload);
+        return { message_id: 200 };
+      },
+    },
+  });
+  const bridge = new TelegramHarnessBridge({
+    bot,
+    state: fixture.state,
+    harness: {
+      createSession: async () => 'session-one',
+      ask: async (_sessionId, _text, askOptions) => {
+        options = askOptions;
+        await answered.promise;
+        return 'ISSUE199_DONE Green';
+      },
+    },
+  });
+  const processing = bridge.accept(message('draft-question', 'Choose a color', { replyTarget: target }));
+  t.after(async () => {
+    refreshGate.resolve();
+    answered.resolve();
+    await processing;
+  });
+  await eventually(() => options !== undefined);
+  t.mock.timers.tick(4_000);
+  await eventually(() => drafts.length === 2);
+  const presentation = options.onInteraction(questionInteraction({
+    questions: [{ id: 'color', question: 'Choose a color', options: [{ label: 'Blue' }, { label: 'Green' }] }],
+    respond: async (response) => {
+      if (!response.ok) return { accepted: true };
+      assert.deepEqual(response.value.answer.answers, [{ id: 'color', selected: ['Green'] }]);
+      answered.resolve();
+      return { accepted: true };
+    },
+  }));
+  const lateProgress = options.onUpdate({ type: 'tool', name: 'ask_user_question' });
+  await new Promise(setImmediate);
+  assert.equal(messages.length, 0, 'the question must wait for an in-flight draft to finish');
+  refreshGate.resolve();
+  await Promise.all([presentation, lateProgress]);
+  assert.equal(messages.length, 1);
+  assert.equal(draftActive, false, 'a late draft must not replace the question and block replies');
+  t.mock.timers.tick(40_000);
+  await options.onUpdate({ type: 'text', text: 'Waiting for your choice' });
+  assert.equal(drafts.length, 2, 'neither heartbeat nor progress may restart the draft');
+  await bridge.accept(message('draft-answer', '2', { replyTarget: target }));
+  await processing;
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].richMessage.markdown, 'ISSUE199_DONE Green');
+});
+
+test('slow Telegram heartbeat does not queue redundant drafts ahead of the final answer', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const fixture = stateFixture();
+  const askGate = deferred();
+  const refreshGate = deferred();
+  const drafts = [];
+  const finals = [];
+  let asked = false;
+  const bot = new TelegramBotClient({
+    api: {
+      // A failed typing request must not release the still-pending draft guard.
+      sendChatAction: async () => { throw new Error('typing unavailable'); },
+      sendRichMessageDraft: async (payload) => {
+        drafts.push(payload);
+        if (drafts.length === 2) await refreshGate.promise;
+        return true;
+      },
+      sendRichMessage: async (payload) => {
+        finals.push(payload);
+        return { message_id: 175 };
+      },
+    },
+    logger: { warn() {} },
+  });
+  const bridge = new TelegramHarnessBridge({
+    bot,
+    harness: {
+      createSession: async () => 'session-slow-heartbeat',
+      ask: async () => { asked = true; return askGate.promise; },
+    },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+  });
+  const accepted = bridge.accept(message('slow-heartbeat', 'long task', {
+    replyTarget: { chatId: 42, chatType: 'private' },
+  }));
+  t.after(async () => {
+    refreshGate.resolve();
+    askGate.resolve('final answer');
+    await accepted;
+  });
+  await eventually(() => asked);
+  t.mock.timers.tick(4_000);
+  await eventually(() => drafts.length === 2);
+  t.mock.timers.tick(40_000);
+  await new Promise(setImmediate);
+  askGate.resolve('final answer');
+  await new Promise(setImmediate);
+  assert.equal(finals.length, 0, 'the final frame still waits for the in-flight draft');
+  refreshGate.resolve();
+  await accepted;
+  assert.equal(drafts.length, 2, 'only the initial draft and one heartbeat were sent');
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].richMessage.markdown, 'final answer');
+  t.mock.timers.tick(40_000);
+  await new Promise(setImmediate);
+  assert.equal(drafts.length, 2, 'no heartbeat after final delivery');
+});
+
+for (const outcome of ['success', 'failure']) {
+  test(`heartbeat recovers after rejection and stops before ${outcome} delivery completes`, async (t) => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const fixture = stateFixture();
+    const askGate = deferred();
+    const deliveryGate = deferred();
+    let asked = false;
+    let finalizing = false;
+    let refreshes = 0;
+    let typings = 0;
+    const finalize = async () => {
+      finalizing = true;
+      await deliveryGate.promise;
+      return { deliveryOutcome: 'sent', providerMessageIds: ['175'] };
+    };
+    const bridge = new TextHarnessBridge({
+      descriptor: { key: 'test', label: 'Test' },
+      bot: {
+        sendText: async () => 'done',
+        sendTyping: async () => { typings += 1; },
+        openDeliveryStream: async () => ({
+          keepalive: true,
+          refresh: async () => {
+            refreshes += 1;
+            if (refreshes === 1) throw new Error('temporary refresh failure');
+          },
+          update: async () => undefined,
+          finish: finalize,
+          fail: finalize,
+        }),
+      },
+      harness: {
+        createSession: async () => `session-heartbeat-${outcome}`,
+        ask: async () => { asked = true; return askGate.promise; },
+      },
+      state: fixture.state,
+      logger: { warn() {}, error() {} },
+    });
+    const accepted = bridge.accept(message(`heartbeat-${outcome}`, 'long task'));
+    t.after(async () => {
+      askGate.resolve('answer');
+      deliveryGate.resolve();
+      await accepted;
+    });
+    await eventually(() => asked);
+    t.mock.timers.tick(4_000);
+    await new Promise(setImmediate);
+    t.mock.timers.tick(4_000);
+    await new Promise(setImmediate);
+    assert.equal(refreshes, 2, 'a rejected heartbeat does not disable later refreshes');
+    if (outcome === 'success') askGate.resolve('answer');
+    else askGate.reject(new Error('turn failed'));
+    await eventually(() => finalizing);
+    const typingAt = typings;
+    t.mock.timers.tick(40_000);
+    await new Promise(setImmediate);
+    assert.equal(refreshes, 2, 'no new refresh while final delivery is pending');
+    assert.equal(typings, typingAt, 'no typing while final delivery is pending');
+    deliveryGate.resolve();
+    await accepted;
+  });
+}
+
+// Email decorates `content` with the mail headers for the model while
+// `controlText` keeps the plain body. Both the command-permission gate and the
+// approval queue parse text, so both must read the control text — reading the
+// decorated form made `/new` unrecognizable as a command (skipping the
+// permission gate) and made "批准" unrecognizable as a decision (approval
+// callback stayed at 0).
+function emailMessage(messageId, body, overrides = {}) {
+  return message(messageId, `From: sender@example.com\nSubject: 测试主题\n\n${body}`, {
+    controlText: body,
+    ...overrides,
+  });
+}
+
+test('a decorated body still has its command gated by canExecuteCommands', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const asks = [];
+  let sessionClears = 0;
+  const originalClearSession = fixture.state.clearSession.bind(fixture.state);
+  fixture.state.clearSession = async (...args) => {
+    sessionClears += 1;
+    return originalClearSession(...args);
+  };
+  let settings = accessPolicy({ canExecuteCommands: false });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+    accessPolicy: {
+      getSettings: () => settings,
+      isPrivileged: () => false,
+    },
+    bot: { sendText: async (_target, text) => sent.push(text) },
+    harness: {
+      createSession: async () => 'session-header-gate',
+      sessionExists: async () => true,
+      ask: async (_sessionId, content) => {
+        asks.push(content);
+        return 'sessions cleared';
+      },
+    },
+  });
+
+  // Seed a session so a denied `/new` would have something to clear.
+  await bridge.accept(emailMessage('header-ordinary', '你好'));
+  assert.equal(asks.length, 1, 'an ordinary decorated message still reaches Harness');
+
+  await bridge.accept(emailMessage('header-command-denied', '/new'));
+  assert.equal(sessionClears, 0,
+    'a decorated `/new` is still recognized as a command and refused');
+  assert.equal(sent.at(-1), COMMAND_PERMISSION_DENIED_MESSAGE,
+    'the sender is told the command was denied');
+
+  settings = accessPolicy({ canExecuteCommands: true });
+  await bridge.accept(emailMessage('header-command-allowed', '/new'));
+  assert.equal(sessionClears, 1, 'a permitted sender may still run the command');
+});
+
+test('an approval reply in a decorated body claims the pending request', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const submitted = [];
+  const answered = deferred();
+  const bridge = createBridge({
+    state: fixture.state,
+    bot: { sendText: async (target, text) => sent.push({ target, text }) },
+    harness: {
+      createSession: async () => 'session-decorated-approval',
+      ask: async (sessionId, _text, options) => {
+        await options.onInteraction(approvalInteraction({
+          id: 'decorated-approval',
+          sessionId,
+          toolName: 'decorated-tool',
+          respond: async (result) => {
+            submitted.push(result);
+            answered.resolve();
+            return { accepted: true };
+          },
+        }));
+        await answered.promise;
+        return '审批完成';
+      },
+    },
+  });
+
+  const processing = bridge.accept(emailMessage('decorated-approval-start', '启动审批'));
+  await eventually(() => sent.some(({ text }) => text.includes('decorated-tool')));
+  await bridge.accept(emailMessage('decorated-approval-reply', '批准'));
+  await processing;
+
+  assert.equal(submitted.length, 1, 'the plain-body approval claimed the request');
+  assert.deepEqual(submitted[0], {
+    ok: true,
+    value: {
+      sessionId: 'session-decorated-approval',
+      approvalId: 'decorated-approval',
+      outcome: 'allowed-once',
+    },
+  });
+});
+
+// A failed turn used to leave `markSeen` behind, turning the id into a permanent
+// tombstone: every later poll short-circuited on `hasSeen` and the message was
+// never retried. A failure must release the mark (bounded), while a success
+// stays exactly-once.
+test('a failed delivery is retried on the next poll instead of being dropped', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const asks = [];
+  let failFirst = true;
+  const bridge = createBridge({
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => sent.push(text) },
+    harness: {
+      createSession: async () => 'session-retry',
+      sessionExists: async () => true,
+      ask: async (_sessionId, text) => {
+        asks.push(text);
+        if (failFirst) {
+          failFirst = false;
+          throw new Error('transient Harness outage');
+        }
+        return '恢复后的答复';
+      },
+    },
+  });
+
+  await bridge.accept(emailMessage('retry-mail', '第一封信'));
+  assert.equal(asks.length, 1, 'the first attempt was delivered and failed');
+  assert.equal(fixture.seen.has('retry-mail'), false,
+    'a failed turn releases its mark so the mail is not lost');
+
+  // The next poll re-presents the same message id.
+  await bridge.accept(emailMessage('retry-mail', '第一封信'));
+  assert.equal(asks.length, 2, 'the next poll re-delivers the same message');
+  assert.equal(sent.at(-1), '恢复后的答复', 'the retry produced the real answer');
+  assert.equal(fixture.seen.has('retry-mail'), true,
+    'a successful retry is marked as handled');
+});
+
+test('a successful delivery stays exactly-once across repeated polls', async () => {
+  const fixture = stateFixture();
+  const asks = [];
+  const bridge = createBridge({
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      createSession: async () => 'session-once',
+      sessionExists: async () => true,
+      ask: async (_sessionId, text) => {
+        asks.push(text);
+        return '唯一一次答复';
+      },
+    },
+  });
+
+  await bridge.accept(emailMessage('once-mail', '只处理一次'));
+  await bridge.accept(emailMessage('once-mail', '只处理一次'));
+  await bridge.accept(emailMessage('once-mail', '只处理一次'));
+
+  assert.equal(asks.length, 1, 'a delivered message is never executed twice');
+  assert.equal(fixture.seen.has('once-mail'), true);
+});
+
+test('a permanently failing delivery stops retrying after a bounded number of attempts', async () => {
+  const fixture = stateFixture();
+  const asks = [];
+  const bridge = createBridge({
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      createSession: async () => 'session-bounded',
+      sessionExists: async () => true,
+      ask: async (_sessionId, text) => {
+        asks.push(text);
+        throw new Error('permanent Harness outage');
+      },
+    },
+  });
+
+  // Poll far more often than the retry budget allows.
+  for (let poll = 0; poll < 10; poll += 1) {
+    await bridge.accept(emailMessage('poison-mail', '永远失败的信'));
+  }
+
+  assert.ok(asks.length > 1, 'a transient-looking failure is retried at least once');
+  assert.ok(asks.length <= 3,
+    `retries are bounded, but the message was attempted ${asks.length} times`);
+  assert.equal(fixture.seen.has('poison-mail'), true,
+    'after the budget is spent the id becomes a tombstone instead of retrying forever');
 });
